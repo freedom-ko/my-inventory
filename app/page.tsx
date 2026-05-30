@@ -11,34 +11,34 @@ export default function InventoryDashboard() {
   const [items, setItems] = useState<any[]>([]);
   const [shortageItems, setShortageItems] = useState<any[]>([]);
   
+  // 💡 신설: 출고 로그 저장 상태 및 우측 피드 전용 탭 상태
+  const [logs, setLogs] = useState<any[]>([]);
+  const [rightTab, setRightTab] = useState<'shortage' | 'logs'>('shortage');
+
   const [leftSearch, setLeftSearch] = useState('');
   const [rightSearch, setRightSearch] = useState('');
+  const [logSearch, setLogSearch] = useState(''); // 💡 로그 전용 독립 검색창
+  
   const [viewMode, setViewMode] = useState<'active' | 'all'>('active');
   const [inputValues, setInputValues] = useState<{ [key: number]: string }>({});
-
-  // 💡 삭제 모드 토글 상태
   const [isDeleteMode, setIsDeleteMode] = useState(false);
 
-  // 재고 변경 모달 상태
+  // 모달 상태
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [selectedItem, setSelectedItem] = useState<any>(null);
   const [targetStock, setTargetStock] = useState<number>(0);
   const [modalMode, setModalMode] = useState<'relative' | 'absolute'>('relative');
   const [relativeChange, setRelativeChange] = useState<number>(0);
 
-  // 새 품목 등록 모달 상태
+  // 등록 및 수정 모달
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [newName, setNewName] = useState('');
   const [newCategory, setNewCategory] = useState('의약품');
   const [newStock, setNewStock] = useState('0');
   const [newSafetyStock, setNewSafetyStock] = useState('50');
   const [newExpireDateInput, setNewExpireDateInput] = useState('');
-
-  // 품목명 수정 모달 상태
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [editName, setEditName] = useState('');
-
-  // 💡 시효기간 추가(분할 등록) 모달 상태
   const [isExpireModalOpen, setIsExpireModalOpen] = useState(false);
   const [expireDate, setExpireDate] = useState('');
   const [expireStock, setExpireStock] = useState('0');
@@ -53,23 +53,31 @@ export default function InventoryDashboard() {
   };
 
   const fetchShortageItems = async () => {
-    const { data } = await supabase
-      .from('items')
-      .select('*')
-      .eq('is_active', true)
-      .lt('current_stock', 50)
-      .order('id', { ascending: false });
+    const { data } = await supabase.from('items').select('*').eq('is_active', true).lt('current_stock', 50).order('id', { ascending: false });
     if (data) setShortageItems(data);
+  };
+
+  // 💡 신설: 최신 소모 로그 70개 호출 엔진
+  const fetchLogs = async () => {
+    const { data } = await supabase.from('inventory_logs').select('*').order('id', { ascending: false }).limit(70);
+    if (data) setLogs(data);
   };
 
   useEffect(() => {
     fetchMainItems(leftSearch, viewMode);
     fetchShortageItems();
-    const channel = supabase.channel('realtime inventory')
+    fetchLogs();
+
+    // 💡 실시간 감지 리스너 리액터 확장 (로그 테이블 변화도 실시간 수신)
+    const channel = supabase.channel('realtime inventory master')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'items' }, () => {
         fetchMainItems(leftSearch, viewMode);
         fetchShortageItems(); 
-      }).subscribe();
+      })
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'inventory_logs' }, () => {
+        fetchLogs();
+      })
+      .subscribe();
     return () => { supabase.removeChannel(channel); };
   }, [viewMode]);
 
@@ -81,7 +89,7 @@ export default function InventoryDashboard() {
   const toggleActiveStatus = async (item: any) => {
     const newStatus = !item.is_active;
     const { error } = await supabase.from('items').update({ is_active: newStatus }).eq('id', item.id);
-    if (error) alert("상태 변경에 실패했습니다: " + error.message);
+    if (error) alert("상태 변경 실패: " + error.message);
   };
 
   const handleInputChange = (itemId: number, value: string) => {
@@ -101,24 +109,36 @@ export default function InventoryDashboard() {
     setSelectedItem(item); setTargetStock(parsedStock); setModalMode('absolute'); setIsModalOpen(true);
   };
 
+  // 💡 핵심 개선: 재고 변동 확정 시 소모(-) 처리 건에 대해 로그 자동 인서트 파이프 결합
   const handleConfirmChange = async () => {
     if (!selectedItem) return;
-    const { error } = await supabase.from('items').update({ current_stock: targetStock }).eq('id', selectedItem.id);
-    if (error) alert("재고 수정 실패: " + error.message);
-    else { setInputValues(prev => ({ ...prev, [selectedItem.id]: '' })); setIsModalOpen(false); setSelectedItem(null); }
+    
+    // 1단계: 재고 수량 오버라이드
+    const { error: itemError } = await supabase.from('items').update({ current_stock: targetStock }).eq('id', selectedItem.id);
+    
+    if (itemError) {
+      alert("재고 수정 실패: " + itemError.message);
+      return;
+    }
+
+    // 2단계: - 버튼을 눌러 감소시킨 '소모' 이벤트인 경우 로그 생성 트리거 작동
+    if (modalMode === 'relative' && relativeChange < 0) {
+      const consumedQty = Math.abs(relativeChange);
+      await supabase.from('inventory_logs').insert([{
+        item_name: selectedItem.name,
+        quantity: consumedQty
+      }]);
+    }
+
+    setInputValues(prev => ({ ...prev, [selectedItem.id]: '' }));
+    setIsModalOpen(false);
+    setSelectedItem(null);
   };
 
   const handleAddItem = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newName.trim()) return;
-    const { error } = await supabase.from('items').insert([{ 
-      name: newName, 
-      category: newCategory, 
-      current_stock: parseInt(newStock, 10) || 0, 
-      safety_stock: parseInt(newSafetyStock, 10) || 50, 
-      expiration_date: newExpireDateInput.trim(),
-      is_active: true 
-    }]);
+    const { error } = await supabase.from('items').insert([{ name: newName, category: newCategory, current_stock: parseInt(newStock, 10) || 0, safety_stock: parseInt(newSafetyStock, 10) || 50, expiration_date: newExpireDateInput.trim(), is_active: true }]);
     if (error) alert("등록 실패: " + error.message);
     else { setIsAddModalOpen(false); setNewName(''); setNewStock('0'); setNewExpireDateInput(''); }
   };
@@ -127,43 +147,33 @@ export default function InventoryDashboard() {
     e.preventDefault();
     if (!selectedItem || !editName.trim()) return;
     const { error } = await supabase.from('items').update({ name: editName.trim() }).eq('id', selectedItem.id);
-    if (error) alert("품목명 수정에 실패했습니다: " + error.message);
+    if (error) alert("명칭 수정 실패: " + error.message);
     else { setIsEditModalOpen(false); setSelectedItem(null); setEditName(''); }
   };
 
-  // 💡 시효기간 분할 등록 승인 (동일 이름, 새로운 시효기간 데이터 행 생성)
   const handleAddExpiration = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedItem || !expireDate.trim()) { alert("시효기간을 입력해주세요."); return; }
-
-    const { error } = await supabase.from('items').insert([{
-      name: selectedItem.name,
-      category: selectedItem.category || '의약품',
-      current_stock: parseInt(expireStock, 10) || 0,
-      safety_stock: selectedItem.safety_stock || 50,
-      expiration_date: expireDate.trim(),
-      is_active: true
-    }]);
-
-    if (error) {
-      alert("시효기간 품목 추가 실패: " + error.message);
-    } else {
-      setIsExpireModalOpen(false);
-      setSelectedItem(null);
-      setExpireDate('');
-      setExpireStock('0');
-    }
+    if (!selectedItem || !expireDate.trim()) return;
+    const { error } = await supabase.from('items').insert([{ name: selectedItem.name, category: selectedItem.category || '의약품', current_stock: parseInt(expireStock, 10) || 0, safety_stock: selectedItem.safety_stock || 50, expiration_date: expireDate.trim(), is_active: true }]);
+    if (error) alert("시효 분할 추가 실패: " + error.message);
+    else { setIsExpireModalOpen(false); setSelectedItem(null); setEditName(''); setExpireStock('0'); }
   };
 
-  // 💡 데이터베이스에서 품목 영구 삭제 처리 함수
   const handleDeleteItem = async (item: any) => {
-    if (!confirm(`[경고] 명단에서 "${item.name}" (시효기간: ${item.expiration_date || '없음'}) 품목을 영구적으로 삭제하시겠습니까?`)) return;
-
+    if (!confirm(`[경고] "${item.name}" 품목을 창고명단에서 영구 철거합니까?`)) return;
     const { error } = await supabase.from('items').delete().eq('id', item.id);
     if (error) alert("삭제 실패: " + error.message);
   };
 
+  // 우측 피드 필터들
   const filteredShortageItems = shortageItems.filter(item => item.name.toLowerCase().includes(rightSearch.toLowerCase()));
+  const filteredLogs = logs.filter(log => log.item_name.toLowerCase().includes(logSearch.toLowerCase()));
+
+  // 💡 한글 날짜 포맷 변환 함수
+  const formatKoreanDate = (isoString: string) => {
+    const d = new Date(isoString);
+    return `${d.getFullYear()}년 ${d.getMonth() + 1}월 ${d.getDate()}일 ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  };
 
   return (
     <div className="flex flex-col lg:flex-row h-screen bg-[#0B0F19] text-gray-200 font-sans overflow-hidden">
@@ -172,35 +182,19 @@ export default function InventoryDashboard() {
       <div className="flex-1 p-4 lg:p-8 overflow-y-auto">
         <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-4 gap-3">
           <h1 className="text-xl lg:text-2xl font-bold text-white tracking-tight">전체 재고 관리 대시보드</h1>
-          
-          {/* 상단 액션 버튼 그룹 */}
           <div className="flex space-x-2">
             <button onClick={() => setIsAddModalOpen(true)} className="px-3 py-2 bg-blue-600 hover:bg-blue-500 font-bold rounded-lg text-white shadow-lg text-xs lg:text-sm whitespace-nowrap">+ 새 품목 등록</button>
-            {/* 💡 삭제 모드 전환 스위치 추가 */}
-            <button 
-              onClick={() => setIsDeleteMode(!isDeleteMode)} 
-              className={`px-3 py-2 font-bold rounded-lg text-white text-xs lg:text-sm whitespace-nowrap transition-colors ${isDeleteMode ? 'bg-red-600 hover:bg-red-500 ring-2 ring-red-400' : 'bg-gray-800 hover:bg-gray-700'}`}
-            >
-              {isDeleteMode ? '🚫 삭제 모드 종료' : '🗑️ 기존 품목 삭제'}
-            </button>
+            <button onClick={() => setIsDeleteMode(!isDeleteMode)} className={`px-3 py-2 font-bold rounded-lg text-white text-xs lg:text-sm whitespace-nowrap transition-colors ${isDeleteMode ? 'bg-red-600 ring-2 ring-red-400' : 'bg-gray-800'}`}>{isDeleteMode ? '🚫 삭제 모드 종료' : '🗑️ 기존 품목 삭제'}</button>
           </div>
         </div>
 
         <div className="flex space-x-2 mb-4 lg:mb-6 bg-[#111827] p-1 rounded-lg w-fit border border-gray-800">
-          <button onClick={() => setViewMode('active')} className={`px-3 py-1.5 lg:px-4 lg:py-2 rounded-md text-xs font-bold transition-all ${viewMode === 'active' ? 'bg-blue-600 text-white shadow' : 'text-gray-400 hover:text-white'}`}>
-            📋 취급 품목만 보기 (기본)
-          </button>
-          <button onClick={() => setViewMode('all')} className={`px-3 py-1.5 lg:px-4 lg:py-2 rounded-md text-xs font-bold transition-all ${viewMode === 'all' ? 'bg-gray-800 text-white shadow border border-gray-700' : 'text-gray-400 hover:text-white'}`}>
-            🌐 전체 창고 보기
-          </button>
+          <button onClick={() => setViewMode('active')} className={`px-3 py-1.5 lg:px-4 lg:py-2 rounded-md text-xs font-bold transition-all ${viewMode === 'active' ? 'bg-blue-600 text-white shadow' : 'text-gray-400 hover:text-white'}`}>📋 취급 품목만 보기 (기본)</button>
+          <button onClick={() => setViewMode('all')} className={`px-3 py-1.5 lg:px-4 lg:py-2 rounded-md text-xs font-bold transition-all ${viewMode === 'all' ? 'bg-gray-800 text-white shadow border border-gray-700' : 'text-gray-400 hover:text-white'}`}>🌐 전체 창고 보기</button>
         </div>
         
         <div className="mb-4 lg:mb-6">
-          <input 
-            type="text" placeholder={viewMode === 'active' ? "현재 취급 품목 실시간 검색..." : "식약처 전체 실시간 검색..."}
-            className="w-full max-w-md p-2.5 lg:p-3 rounded-lg bg-[#111827] border border-gray-700 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition-colors shadow-inner text-sm"
-            value={leftSearch} onChange={(e) => setLeftSearch(e.target.value)}
-          />
+          <input type="text" placeholder={viewMode === 'active' ? "현재 취급 품목 실시간 검색..." : "식약처 전체 실시간 검색..."} className="w-full max-w-md p-2.5 lg:p-3 rounded-lg bg-[#111827] border border-gray-700 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition-colors shadow-inner text-sm" value={leftSearch} onChange={(e) => setLeftSearch(e.target.value)} />
         </div>
 
         <div className="bg-[#111827] rounded-xl shadow-2xl border border-gray-800/80 p-3 lg:p-5 overflow-x-auto">
@@ -210,61 +204,36 @@ export default function InventoryDashboard() {
                 {isDeleteMode && <th className="pb-3 font-semibold text-center w-12 text-red-400">삭제</th>}
                 <th className="pb-3 font-semibold w-20">고유 번호</th>
                 <th className="pb-3 font-semibold w-1/3">품목명</th>
-                {/* 💡 시효기간 테이블 열 신설 */}
                 <th className="pb-3 font-semibold w-32 text-center text-yellow-400">시효기간</th>
                 <th className="pb-3 font-semibold text-center w-24">취급 상태</th>
-                <th className="pb-3 font-semibold text-center w-80">재고 제어 (단품 / 대량)</th>
+                <th className="pb-3 font-semibold text-center w-80">재고 제어</th>
                 <th className="pb-3 font-semibold text-right pr-6 w-24">현재고</th>
               </tr>
             </thead>
             <tbody>
               {items.map(item => (
                 <tr key={item.id} className={`border-b border-gray-800/60 hover:bg-gray-800/30 transition-all duration-150 group ${!item.is_active && 'opacity-50'}`}>
-                  
-                  {/* 💡 삭제 모드일 때만 쓰레기통 버튼이 노출됨 */}
                   {isDeleteMode && (
                     <td className="py-4 text-center">
-                      <button onClick={() => handleDeleteItem(item)} className="p-1.5 rounded bg-red-950/40 hover:bg-red-600 text-red-400 hover:text-white transition-colors">
-                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4"><path strokeLinecap="round" strokeLinejoin="round" d="m14.74 9-.34 12m-4.72 0L9 9m11.42 3.31a48.667 48.667 0 0 0-7.36-1.91M3.14 12.29a48.008 48.008 0 0 1 7.36-1.91M19.485 12c.262 2.384.444 4.8.54 7.232M4.515 12c-.263 2.384-.444 4.8-.54 7.232M8.25 4.5h7.5M4.56 8.25h14.88" /></svg>
-                      </button>
+                      <button onClick={() => handleDeleteItem(item)} className="p-1.5 rounded bg-red-950/40 hover:bg-red-600 text-red-400 hover:text-white"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4"><path strokeLinecap="round" strokeLinejoin="round" d="m14.74 9-.34 12m-4.72 0L9 9m11.42 3.31a48.667 48.667 0 0 0-7.36-1.91M3.14 12.29a48.008 48.008 0 0 1 7.36-1.91M19.485 12c.262 2.384.444 4.8.54 7.232M4.515 12c-.263 2.384-.444 4.8-.54 7.232M8.25 4.5h7.5M4.56 8.25h14.88" /></svg></button>
                     </td>
                   )}
-
                   <td className="py-4 text-gray-500 text-sm">#{item.id}</td>
-                  
                   <td className="py-4 font-medium text-white">
                     <div className="flex items-center">
                       <span className="truncate max-w-xs">{item.name}</span>
-                      <button 
-                        onClick={() => { setSelectedItem(item); setEditName(item.name); setIsEditModalOpen(true); }}
-                        className="ml-2 opacity-100 lg:opacity-0 lg:group-hover:opacity-100 text-gray-400 hover:text-blue-400 transition-all p-1 rounded hover:bg-gray-800 bg-gray-800/50 lg:bg-transparent" title="품목명 수정"
-                      >
-                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.8} stroke="currentColor" className="w-3.5 h-3.5"><path strokeLinecap="round" strokeLinejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L6.832 19.82a4.5 4.5 0 0 1-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 0 1 1.13-1.897L16.863 4.487Zm0 0L19.5 7.125" /></svg>
-                      </button>
+                      <button onClick={() => { setSelectedItem(item); setEditName(item.name); setIsEditModalOpen(true); }} className="ml-2 opacity-100 lg:opacity-0 lg:group-hover:opacity-100 text-gray-400 hover:text-blue-400 p-1 rounded hover:bg-gray-800 bg-gray-800/50 lg:bg-transparent"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.8} stroke="currentColor" className="w-3.5 h-3.5"><path strokeLinecap="round" strokeLinejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L6.832 19.82a4.5 4.5 0 0 1-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 0 1 1.13-1.897L16.863 4.487Zm0 0L19.5 7.125" /></svg></button>
                     </div>
                   </td>
-                  
-                  {/* 💡 시효기간 표시 및 분할 추가 액션 탑재 */}
                   <td className="py-4 text-center">
                     <div className="flex flex-col items-center justify-center gap-1">
                       <span className="text-sm font-semibold text-gray-300 bg-gray-900/60 px-2 py-0.5 rounded border border-gray-800">{item.expiration_date || '미기입'}</span>
-                      {item.is_active && (
-                        <button 
-                          onClick={() => { setSelectedItem(item); setIsExpireModalOpen(true); }}
-                          className="text-[10px] bg-yellow-600/20 hover:bg-yellow-600 text-yellow-400 hover:text-white px-1.5 py-0.5 rounded border border-yellow-600/30 transition-all font-bold"
-                        >
-                          + 시효 추가
-                        </button>
-                      )}
+                      {item.is_active && <button onClick={() => { setSelectedItem(item); setIsExpireModalOpen(true); }} className="text-[10px] bg-yellow-600/20 hover:bg-yellow-600 text-yellow-400 hover:text-white px-1.5 py-0.5 rounded border border-yellow-600/30 transition-all font-bold">+ 시효 추가</button>}
                     </div>
                   </td>
-                  
                   <td className="py-4 text-center">
-                    <button onClick={() => toggleActiveStatus(item)} className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${item.is_active ? 'bg-blue-600' : 'bg-gray-700'}`}>
-                      <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${item.is_active ? 'translate-x-6' : 'translate-x-1'}`} />
-                    </button>
+                    <button onClick={() => toggleActiveStatus(item)} className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${item.is_active ? 'bg-blue-600' : 'bg-gray-700'}`}><span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${item.is_active ? 'translate-x-6' : 'translate-x-1'}`} /></button>
                   </td>
-
                   <td className="py-4 text-center">
                     <div className="inline-flex items-center space-x-3 bg-[#0B0F19]/40 px-3 py-1.5 rounded-lg border border-gray-800">
                       <div className="inline-flex rounded-md shadow-sm bg-[#0B0F19] p-0.5 border border-gray-700">
@@ -279,7 +248,6 @@ export default function InventoryDashboard() {
                       </div>
                     </div>
                   </td>
-
                   <td className={`py-4 font-bold text-right pr-6 text-lg ${item.current_stock < 50 ? 'text-red-400' : 'text-emerald-400'}`}>{item.current_stock}</td>
                 </tr>
               ))}
@@ -288,25 +256,59 @@ export default function InventoryDashboard() {
         </div>
       </div>
 
-      {/* 🔴 우측 하단: 긴급 보충 피드 */}
-      <div className="w-full lg:w-96 h-[40vh] lg:h-auto bg-[#111827] border-t lg:border-t-0 lg:border-l border-gray-800/80 p-4 lg:p-6 flex flex-col shadow-2xl shrink-0 z-10">
-        <div className="flex items-center mb-3 border-b border-gray-800 pb-3">
-          <div className="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse mr-2.5"></div>
-          <h2 className="text-lg lg:text-xl font-bold text-red-400 tracking-tight">긴급 보충 피드</h2>
+      {/* 🔴 우측 탭 제어 피드 영역 */}
+      <div className="w-full lg:w-96 h-[45vh] lg:h-auto bg-[#111827] border-t lg:border-t-0 lg:border-l border-gray-800/80 p-4 lg:p-6 flex flex-col shadow-2xl shrink-0 z-10">
+        
+        {/* 💡 피드 상단 서브 토글 탭 신설 */}
+        <div className="flex space-x-1 bg-[#0B0F19] p-1 rounded-lg border border-gray-800 mb-4">
+          <button onClick={() => setRightTab('shortage')} className={`flex-1 py-2 text-center rounded-md text-xs font-black transition-all ${rightTab === 'shortage' ? 'bg-red-950/60 text-red-400 border border-red-900/40 shadow' : 'text-gray-500 hover:text-gray-300'}`}>
+            🚨 긴급 보충
+          </button>
+          <button onClick={() => setRightTab('logs')} className={`flex-1 py-2 text-center rounded-md text-xs font-black transition-all ${rightTab === 'logs' ? 'bg-blue-950/60 text-blue-400 border border-blue-900/40 shadow' : 'text-gray-500 hover:text-gray-300'}`}>
+            📋 소모 로그 보드
+          </button>
         </div>
-        <div className="mb-3"><input type="text" placeholder="부족 품목 중 검색..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs" value={rightSearch} onChange={(e) => setRightSearch(e.target.value)} /></div>
-        <div className="flex-1 overflow-y-auto space-y-2.5 pr-1 scrollbar-thin">
-          {filteredShortageItems.map(item => (
-            <div key={item.id} className="bg-red-950/20 border border-red-900/50 p-3 rounded-xl flex flex-col">
-              <span className="font-semibold text-red-200 text-sm mb-0.5">{item.name}</span>
-              <span className="text-[10px] text-yellow-500 mb-1">시효기간: {item.expiration_date || '미기입'}</span>
-              <div className="flex justify-between items-center"><span className="text-xs text-gray-500">#{item.id}</span><span className="text-xs text-gray-400">재고: <span className="text-red-400 font-black">{item.current_stock}개</span></span></div>
+
+        {/* 탭 1: 긴급 보충 뷰 */}
+        {rightTab === 'shortage' && (
+          <div className="flex flex-col flex-1 overflow-hidden">
+            <div className="mb-3"><input type="text" placeholder="부족 품목 중 검색..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs focus:outline-none focus:border-red-500" value={rightSearch} onChange={(e) => setRightSearch(e.target.value)} /></div>
+            <div className="flex-1 overflow-y-auto space-y-2.5 pr-1 scrollbar-thin">
+              {filteredShortageItems.map(item => (
+                <div key={item.id} className="bg-red-950/20 border border-red-900/50 p-3 rounded-xl flex flex-col shadow-md">
+                  <span className="font-semibold text-red-200 text-sm mb-0.5">{item.name}</span>
+                  <span className="text-[10px] text-yellow-500 mb-1">시효기간: {item.expiration_date || '미기입'}</span>
+                  <div className="flex justify-between items-center"><span className="text-xs text-gray-500">#{item.id}</span><span className="text-xs text-gray-400">재고: <span className="text-red-400 font-black">{item.current_stock}개</span></span></div>
+                </div>
+              ))}
+              {filteredShortageItems.length === 0 && <div className="text-center text-gray-500 mt-10 text-xs">부족 품목 목록이 비어있습니다.</div>}
             </div>
-          ))}
-        </div>
+          </div>
+        )}
+
+        {/* 💡 탭 2: 실시간 소모 로그 뷰 신설 */}
+        {rightTab === 'logs' && (
+          <div className="flex flex-col flex-1 overflow-hidden">
+            <div className="mb-3"><input type="text" placeholder="로그 기록 내품목 검색..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs focus:outline-none focus:border-blue-500" value={logSearch} onChange={(e) => setLogSearch(e.target.value)} /></div>
+            <div className="flex-1 overflow-y-auto space-y-2 pr-1 scrollbar-thin">
+              {filteredLogs.map(log => (
+                <div key={log.id} className="bg-blue-950/10 border border-blue-950/60 p-3 rounded-xl shadow-sm flex flex-col border-l-4 border-l-blue-500">
+                  <span className="text-[11px] text-gray-400 font-medium mb-1">{formatKoreanDate(log.created_at)}</span>
+                  <div className="flex justify-between items-start">
+                    <span className="text-white text-xs font-semibold max-w-[180px] truncate">{log.item_name}</span>
+                    <span className="text-red-400 font-bold text-xs bg-red-950/30 px-2 py-0.5 rounded border border-red-900/20 shrink-0">
+                      -{log.quantity}개 소모
+                    </span>
+                  </div>
+                </div>
+              ))}
+              {filteredLogs.length === 0 && <div className="text-center text-gray-500 mt-10 text-xs">소모 처리 이력이 존재하지 않습니다.</div>}
+            </div>
+          </div>
+        )}
       </div>
 
-      {/* 💡 팝업 1: 시효기간 추가 (동일 약품 기한 분할 등록) 모달창 */}
+      {/* 모달 팝업 리스트 구조 유지 */}
       {isExpireModalOpen && selectedItem && (
         <div className="fixed inset-0 bg-black/85 flex items-center justify-center z-50 p-4 backdrop-blur-md">
           <form onSubmit={handleAddExpiration} className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-sm w-full space-y-4 shadow-2xl">
@@ -317,7 +319,7 @@ export default function InventoryDashboard() {
               <input type="text" required placeholder="예: 2026-12-31" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm" value={expireDate} onChange={(e) => setExpireDate(e.target.value)} />
             </div>
             <div>
-              <label className="block text-[11px] text-gray-400 mb-1">해당 시효 품목의 초기 재고</label>
+              <label className="block text-[11px] text-gray-400 mb-1">초기 수량</label>
               <input type="number" min="0" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm text-center" value={expireStock} onChange={(e) => setExpireStock(e.target.value)} />
             </div>
             <div className="flex space-x-2 justify-end pt-2 border-t border-gray-800">
@@ -328,7 +330,6 @@ export default function InventoryDashboard() {
         </div>
       )}
 
-      {/* 팝업 2: 수동 새 품목 등록 모달 */}
       {isAddModalOpen && (
         <div className="fixed inset-0 bg-black/85 flex items-center justify-center z-50 p-4 backdrop-blur-md">
           <form onSubmit={handleAddItem} className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-md w-full space-y-4">
@@ -365,7 +366,6 @@ export default function InventoryDashboard() {
         </div>
       )}
 
-      {/* 팝업 3: 명칭 변경 */}
       {isEditModalOpen && selectedItem && (
         <div className="fixed inset-0 bg-black/85 flex items-center justify-center z-50 p-4 backdrop-blur-md">
           <form onSubmit={handleUpdateName} className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-sm w-full space-y-4">
@@ -376,12 +376,11 @@ export default function InventoryDashboard() {
         </div>
       )}
 
-      {/* 팝업 4: 재고 수정 최종 컨펌 */}
       {isModalOpen && selectedItem && (
          <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
           <div className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-sm w-full">
             <h3 className="text-sm font-bold text-white mb-2">⚠️ 재고 변경 최종 승인</h3>
-            <p className="text-xs text-gray-400">[{selectedItem.name}] 기한:({selectedItem.expiration_date || '없음'}) 수량을 {targetStock}개로 업데이트합니다.</p>
+            <p className="text-xs text-gray-400">[{selectedItem.name}] 수량을 {targetStock}개로 업데이트합니까?</p>
             <div className="flex space-x-2 justify-end mt-4"><button onClick={() => setIsModalOpen(false)} className="px-3 py-1.5 bg-gray-800 text-xs text-white">취소</button><button onClick={handleConfirmChange} className="px-3 py-1.5 bg-blue-600 text-xs text-white">변경 승인</button></div>
           </div>
         </div>
