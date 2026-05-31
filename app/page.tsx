@@ -141,20 +141,21 @@ export default function InventoryDashboard() {
       }
     }
 
-    // 💡 1. 국가 공공데이터 API에 먼저 질의 (통신 대기)
+    // 💡 1. 국가 공공데이터 API에 질의 (심평원 15067462 규격 완벽 호환 패치)
     let fetchedName = '';
     let fetchedCategory = '의약품';
     const govApiKey = process.env.NEXT_PUBLIC_BARCODE_API_KEY;
 
     if (govApiKey) {
       try {
-        // 공공데이터포털 표준 의약품 조회 엔드포인트 규격 (JSON)
-        const res = await fetch(`https://apis.data.go.kr/B551182/medicineInfoService/getMedicineInfo?ServiceKey=${govApiKey}&bar_cd=${cleanBarcode}&_type=json`);
+        // 대표님께서 찾으신 심평원 표준코드 API 규격에 맞춘 통신 주소 
+        const url = `https://api.odcloud.kr/api/15067462/v1/uddi:8cae86af-2ac7-4dde-a515-a7511994f74b?page=1&perPage=1&match[의약품표준코드]=${cleanBarcode}&serviceKey=${govApiKey}`;
+        const res = await fetch(url);
         const data = await res.json();
         
-        // 데이터가 정상 수신되었을 경우 이름 추출
-        if (data?.response?.body?.items?.item && data.response.body.items.item.length > 0) {
-          fetchedName = data.response.body.items.item[0].item_name;
+        // 데이터가 정상 수신되었을 경우 '제품명' 추출
+        if (data?.data && data.data.length > 0) {
+          fetchedName = data.data[0]['제품명']; 
         }
       } catch (e) {
         console.warn("국가 서버 통신 지연, 로컬 캐시로 전환합니다.", e);
