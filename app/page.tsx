@@ -93,12 +93,10 @@ export default function InventoryDashboard() {
     setInputValues(prev => ({ ...prev, [itemId]: value }));
   };
 
-  // 💡 즉각 반응 엔진 및 로그 에러 감지기 결합
   const handleRelativeClick = async (item: any, change: number) => {
     const newStock = item.current_stock + change;
     if (newStock < 0) { alert("재고는 0개 미만으로 내려갈 수 없습니다."); return; }
     
-    // 1. 화면 즉시 반영 (Optimistic UI)
     setItems(prev => prev.map(i => i.id === item.id ? { ...i, current_stock: newStock } : i));
     
     const { error } = await supabase.from('items').update({ current_stock: newStock }).eq('id', item.id);
@@ -108,16 +106,10 @@ export default function InventoryDashboard() {
       return;
     }
 
-    // 2. 소모 처리 로그 기록 (권한 에러 발생 시 팝업 경고 추가)
     if (change < 0) {
       const consumedQty = Math.abs(change);
       const { error: logError } = await supabase.from('inventory_logs').insert([{ item_name: item.name, quantity: consumedQty }]);
-      
-      if (logError) {
-        alert("🚨 로그 기록 권한 에러: Supabase SQL에서 권한 해제 명령어를 실행했는지 확인해주세요! (" + logError.message + ")");
-      } else {
-        fetchLogs(); 
-      }
+      if (!logError) fetchLogs(); 
     }
     fetchShortageItems();
   };
@@ -187,6 +179,25 @@ export default function InventoryDashboard() {
     return `${d.getFullYear()}년 ${d.getMonth() + 1}월 ${d.getDate()}일 ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
   };
 
+  // 💡 신설: 시효기간 신호등 분석 엔진
+  const getExpireStatus = (dateStr: string) => {
+    if (!dateStr || dateStr.trim() === '') return { text: '미기입', classes: 'text-gray-400 bg-gray-900/60 border-gray-800' };
+    
+    const expDate = new Date(dateStr);
+    if (isNaN(expDate.getTime())) return { text: dateStr, classes: 'text-gray-400 bg-gray-900/60 border-gray-800' };
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0); // 시간 단위를 자정으로 통일하여 정확한 일수 계산
+    
+    const diffTime = expDate.getTime() - today.getTime();
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)); // 남은 일수
+
+    if (diffDays < 0) return { text: `${dateStr} (만료)`, classes: 'text-white font-bold bg-red-600 border-red-500 animate-pulse' }; // 만료
+    if (diffDays < 180) return { text: dateStr, classes: 'text-red-400 font-bold bg-red-950/60 border-red-900/60' }; // 6개월(180일) 미만
+    if (diffDays < 365) return { text: dateStr, classes: 'text-yellow-400 font-bold bg-yellow-950/60 border-yellow-900/60' }; // 1년(365일) 미만
+    return { text: dateStr, classes: 'text-emerald-400 font-bold bg-emerald-950/60 border-emerald-900/60' }; // 1년 이상 남음
+  };
+
   return (
     <div className="flex flex-col lg:flex-row h-screen bg-[#0B0F19] text-gray-200 font-sans overflow-hidden">
       
@@ -223,46 +234,56 @@ export default function InventoryDashboard() {
               </tr>
             </thead>
             <tbody>
-              {items.map(item => (
-                <tr key={item.id} className={`border-b border-gray-800/60 hover:bg-gray-800/30 transition-all duration-150 group ${!item.is_active && 'opacity-50'}`}>
-                  {isDeleteMode && (
-                    <td className="py-4 text-center">
-                      <button onClick={() => handleDeleteItem(item)} className="p-1.5 rounded bg-red-950/40 hover:bg-red-600 text-red-400 hover:text-white"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4"><path strokeLinecap="round" strokeLinejoin="round" d="m14.74 9-.34 12m-4.72 0L9 9m11.42 3.31a48.667 48.667 0 0 0-7.36-1.91M3.14 12.29a48.008 48.008 0 0 1 7.36-1.91M19.485 12c.262 2.384.444 4.8.54 7.232M4.515 12c-.263 2.384-.444 4.8-.54 7.232M8.25 4.5h7.5M4.56 8.25h14.88" /></svg></button>
+              {items.map(item => {
+                // 💡 반복문 내에서 개별 아이템의 시효 상태를 계산
+                const expireStatus = getExpireStatus(item.expiration_date);
+
+                return (
+                  <tr key={item.id} className={`border-b border-gray-800/60 hover:bg-gray-800/30 transition-all duration-150 group ${!item.is_active && 'opacity-50'}`}>
+                    {isDeleteMode && (
+                      <td className="py-4 text-center">
+                        <button onClick={() => handleDeleteItem(item)} className="p-1.5 rounded bg-red-950/40 hover:bg-red-600 text-red-400 hover:text-white"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4"><path strokeLinecap="round" strokeLinejoin="round" d="m14.74 9-.34 12m-4.72 0L9 9m11.42 3.31a48.667 48.667 0 0 0-7.36-1.91M3.14 12.29a48.008 48.008 0 0 1 7.36-1.91M19.485 12c.262 2.384.444 4.8.54 7.232M4.515 12c-.263 2.384-.444 4.8-.54 7.232M8.25 4.5h7.5M4.56 8.25h14.88" /></svg></button>
+                      </td>
+                    )}
+                    <td className="py-4 text-gray-500 text-sm">#{item.id}</td>
+                    <td className="py-4 font-medium text-white">
+                      <div className="flex items-center">
+                        <span className="truncate max-w-xs">{item.name}</span>
+                        <button onClick={() => { setSelectedItem(item); setEditName(item.name); setIsEditModalOpen(true); }} className="ml-2 opacity-100 lg:opacity-0 lg:group-hover:opacity-100 text-gray-400 hover:text-blue-400 p-1 rounded hover:bg-gray-800 bg-gray-800/50 lg:bg-transparent"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.8} stroke="currentColor" className="w-3.5 h-3.5"><path strokeLinecap="round" strokeLinejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L6.832 19.82a4.5 4.5 0 0 1-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 0 1 1.13-1.897L16.863 4.487Zm0 0L19.5 7.125" /></svg></button>
+                      </div>
                     </td>
-                  )}
-                  <td className="py-4 text-gray-500 text-sm">#{item.id}</td>
-                  <td className="py-4 font-medium text-white">
-                    <div className="flex items-center">
-                      <span className="truncate max-w-xs">{item.name}</span>
-                      <button onClick={() => { setSelectedItem(item); setEditName(item.name); setIsEditModalOpen(true); }} className="ml-2 opacity-100 lg:opacity-0 lg:group-hover:opacity-100 text-gray-400 hover:text-blue-400 p-1 rounded hover:bg-gray-800 bg-gray-800/50 lg:bg-transparent"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.8} stroke="currentColor" className="w-3.5 h-3.5"><path strokeLinecap="round" strokeLinejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L6.832 19.82a4.5 4.5 0 0 1-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 0 1 1.13-1.897L16.863 4.487Zm0 0L19.5 7.125" /></svg></button>
-                    </div>
-                  </td>
-                  <td className="py-4 text-center">
-                    <div className="flex flex-col items-center justify-center gap-1">
-                      <span className="text-sm font-semibold text-gray-300 bg-gray-900/60 px-2 py-0.5 rounded border border-gray-800">{item.expiration_date || '미기입'}</span>
-                      {item.is_active && <button onClick={() => { setSelectedItem(item); setIsExpireModalOpen(true); }} className="text-[10px] bg-yellow-600/20 hover:bg-yellow-600 text-yellow-400 hover:text-white px-1.5 py-0.5 rounded border border-yellow-600/30 transition-all font-bold">+ 시효 추가</button>}
-                    </div>
-                  </td>
-                  <td className="py-4 text-center">
-                    <button onClick={() => toggleActiveStatus(item)} className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${item.is_active ? 'bg-blue-600' : 'bg-gray-700'}`}><span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${item.is_active ? 'translate-x-6' : 'translate-x-1'}`} /></button>
-                  </td>
-                  <td className="py-4 text-center">
-                    <div className="inline-flex items-center space-x-3 bg-[#0B0F19]/40 px-3 py-1.5 rounded-lg border border-gray-800">
-                      <div className="inline-flex rounded-md shadow-sm bg-[#0B0F19] p-0.5 border border-gray-700">
-                        <button onClick={() => handleRelativeClick(item, -1)} disabled={!item.is_active} className="px-3 py-1 text-sm font-bold text-red-400 hover:bg-gray-800 rounded disabled:opacity-30">-</button>
-                        <span className="px-1 text-gray-700">|</span>
-                        <button onClick={() => handleRelativeClick(item, 1)} disabled={!item.is_active} className="px-3 py-1 text-sm font-bold text-green-400 hover:bg-gray-800 rounded disabled:opacity-30">+</button>
+                    
+                    {/* 💡 시효기간 배지에 신호등 시스템 동적 클래스 부여 */}
+                    <td className="py-4 text-center">
+                      <div className="flex flex-col items-center justify-center gap-1">
+                        <span className={`text-[11px] px-2 py-0.5 rounded border transition-colors ${expireStatus.classes}`}>
+                          {expireStatus.text}
+                        </span>
+                        {item.is_active && <button onClick={() => { setSelectedItem(item); setIsExpireModalOpen(true); }} className="text-[10px] bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-1.5 py-0.5 rounded border border-gray-700 transition-all font-medium mt-0.5">+ 기한 추가</button>}
                       </div>
-                      <span className="text-gray-700 font-light">/</span>
-                      <div className="flex items-center space-x-1.5">
-                        <input type="number" min="0" placeholder="대량" disabled={!item.is_active} className="w-16 p-1.5 text-center rounded bg-[#0B0F19] border border-gray-700 text-white text-xs" value={inputValues[item.id] || ''} onChange={(e) => handleInputChange(item.id, e.target.value)} />
-                        <button onClick={() => handleAbsoluteClick(item)} disabled={!item.is_active} className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 text-xs font-bold rounded text-white transition-colors disabled:opacity-30">적용</button>
+                    </td>
+                    
+                    <td className="py-4 text-center">
+                      <button onClick={() => toggleActiveStatus(item)} className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${item.is_active ? 'bg-blue-600' : 'bg-gray-700'}`}><span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${item.is_active ? 'translate-x-6' : 'translate-x-1'}`} /></button>
+                    </td>
+                    <td className="py-4 text-center">
+                      <div className="inline-flex items-center space-x-3 bg-[#0B0F19]/40 px-3 py-1.5 rounded-lg border border-gray-800">
+                        <div className="inline-flex rounded-md shadow-sm bg-[#0B0F19] p-0.5 border border-gray-700">
+                          <button onClick={() => handleRelativeClick(item, -1)} disabled={!item.is_active} className="px-3 py-1 text-sm font-bold text-red-400 hover:bg-gray-800 rounded disabled:opacity-30">-</button>
+                          <span className="px-1 text-gray-700">|</span>
+                          <button onClick={() => handleRelativeClick(item, 1)} disabled={!item.is_active} className="px-3 py-1 text-sm font-bold text-green-400 hover:bg-gray-800 rounded disabled:opacity-30">+</button>
+                        </div>
+                        <span className="text-gray-700 font-light">/</span>
+                        <div className="flex items-center space-x-1.5">
+                          <input type="number" min="0" placeholder="대량" disabled={!item.is_active} className="w-16 p-1.5 text-center rounded bg-[#0B0F19] border border-gray-700 text-white text-xs" value={inputValues[item.id] || ''} onChange={(e) => handleInputChange(item.id, e.target.value)} />
+                          <button onClick={() => handleAbsoluteClick(item)} disabled={!item.is_active} className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 text-xs font-bold rounded text-white transition-colors disabled:opacity-30">적용</button>
+                        </div>
                       </div>
-                    </div>
-                  </td>
-                  <td className={`py-4 font-bold text-right pr-6 text-lg transition-all ${item.current_stock < 50 ? 'text-red-400' : 'text-emerald-400'}`}>{item.current_stock}</td>
-                </tr>
-              ))}
+                    </td>
+                    <td className={`py-4 font-bold text-right pr-6 text-lg transition-all ${item.current_stock < 50 ? 'text-red-400' : 'text-emerald-400'}`}>{item.current_stock}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -279,13 +300,21 @@ export default function InventoryDashboard() {
           <div className="flex flex-col flex-1 overflow-hidden">
             <div className="mb-3"><input type="text" placeholder="부족 품목 중 검색..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs focus:outline-none focus:border-red-500" value={rightSearch} onChange={(e) => setRightSearch(e.target.value)} /></div>
             <div className="flex-1 overflow-y-auto space-y-2.5 pr-1 scrollbar-thin">
-              {filteredShortageItems.map(item => (
-                <div key={item.id} className="bg-red-950/20 border border-red-900/50 p-3 rounded-xl flex flex-col shadow-md">
-                  <span className="font-semibold text-red-200 text-sm mb-0.5">{item.name}</span>
-                  <span className="text-[10px] text-yellow-500 mb-1">시효기간: {item.expiration_date || '미기입'}</span>
-                  <div className="flex justify-between items-center"><span className="text-xs text-gray-500">#{item.id}</span><span className="text-xs text-gray-400">재고: <span className="text-red-400 font-black">{item.current_stock}개</span></span></div>
-                </div>
-              ))}
+              {filteredShortageItems.map(item => {
+                // 💡 피드에서도 신호등 컬러 연동
+                const expireStatus = getExpireStatus(item.expiration_date);
+
+                return (
+                  <div key={item.id} className="bg-red-950/20 border border-red-900/50 p-3 rounded-xl flex flex-col shadow-md">
+                    <span className="font-semibold text-red-200 text-sm mb-1.5">{item.name}</span>
+                    <div className="flex justify-between items-center mb-1">
+                       <span className={`text-[10px] px-1.5 py-0.5 rounded border ${expireStatus.classes}`}>기한: {expireStatus.text}</span>
+                       <span className="text-xs text-gray-500">#{item.id}</span>
+                    </div>
+                    <div className="flex justify-end items-center"><span className="text-xs text-gray-400">재고: <span className="text-red-400 font-black">{item.current_stock}개</span></span></div>
+                  </div>
+                );
+              })}
               {filteredShortageItems.length === 0 && <div className="text-center text-gray-500 mt-10 text-xs">부족 품목 목록이 비어있습니다.</div>}
             </div>
           </div>
@@ -315,7 +344,7 @@ export default function InventoryDashboard() {
           <form onSubmit={handleAddExpiration} className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-sm w-full space-y-4 shadow-2xl">
             <h3 className="text-sm font-bold text-yellow-400 pb-2 border-b border-gray-800">⏳ 시효기간별 품목 분할 등록</h3>
             <p className="text-xs text-gray-400">선택 약품: <span className="text-white font-bold">{selectedItem.name}</span></p>
-            <div><label className="block text-[11px] text-gray-400 mb-1">새로운 시효기간 입력</label><input type="text" required placeholder="예: 2026-12-31" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm" value={expireDate} onChange={(e) => setExpireDate(e.target.value)} /></div>
+            <div><label className="block text-[11px] text-gray-400 mb-1">새로운 시효기간 (YYYY-MM-DD 권장)</label><input type="text" required placeholder="예: 2026-12-31" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm" value={expireDate} onChange={(e) => setExpireDate(e.target.value)} /></div>
             <div><label className="block text-[11px] text-gray-400 mb-1">초기 수량</label><input type="number" min="0" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm text-center" value={expireStock} onChange={(e) => setExpireStock(e.target.value)} /></div>
             <div className="flex space-x-2 justify-end pt-2 border-t border-gray-800"><button type="button" onClick={() => { setIsExpireModalOpen(false); setSelectedItem(null); }} className="px-3 py-1.5 bg-gray-800 text-xs rounded">취소</button><button type="submit" className="px-3 py-1.5 bg-yellow-600 text-xs text-white rounded font-bold">분리 등록 완료</button></div>
           </form>
