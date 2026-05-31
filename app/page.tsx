@@ -145,11 +145,41 @@ export default function InventoryDashboard() {
       }
     }
 
-    // 2단계: 번역기를 통해 식약처 명부에 등록된 기성 의약품 정보가 있는지 조회
-    const mappedProduct = BARCODE_MASTER_DB[cleanBarcode];
+    // 💡 1. 국가 공공데이터 API에 질의 (심평원 15067462 규격 완벽 호환 패치)
+    let fetchedName = '';
+    let fetchedCategory = '의약품';
+    const govApiKey = process.env.NEXT_PUBLIC_BARCODE_API_KEY;
+
+    if (govApiKey) {
+      try {
+        // 대표님께서 찾으신 심평원 표준코드 API 규격에 맞춘 통신 주소 
+        const url = `https://api.odcloud.kr/api/15067462/v1/uddi:8cae86af-2ac7-4dde-a515-a7511994f74b?page=1&perPage=1&match[의약품표준코드]=${cleanBarcode}&serviceKey=${govApiKey}`;
+        const res = await fetch(url);
+        const data = await res.json();
+        
+        // 데이터가 정상 수신되었을 경우 '제품명' 추출
+        if (data?.data && data.data.length > 0) {
+          fetchedName = data.data[0]['제품명']; 
+        }
+      } catch (e) {
+        console.warn("국가 서버 통신 지연, 로컬 캐시로 전환합니다.", e);
+      }
+    }
+
+    // 2단계: 국가 API에서 이름을 못 찾았을 경우, 번역기(로컬 캐시)를 통해 정보가 있는지 조회
+    let finalName = fetchedName;
+    let finalCategory = fetchedCategory;
+
+    if (!finalName) {
+      const mappedProduct = BARCODE_MASTER_DB[cleanBarcode];
+      if (mappedProduct) {
+        finalName = mappedProduct.name;
+        finalCategory = mappedProduct.category;
+      }
+    }
 
     // 3단계: 현재 우리 데이터베이스 창고에 이미 해당 품목 이름이 올라와 있는지 대조
-    const { data: existingItems } = await supabase.from('items').select('*').ilike('name', mappedProduct ? mappedProduct.name : `%${cleanBarcode}%`);
+    const { data: existingItems } = await supabase.from('items').select('*').ilike('name', finalName ? finalName : `%${cleanBarcode}%`);
 
     if (existingItems && existingItems.length > 0) {
       // 명단에 이미 있는 약품이면 즉각 필터링 화면 배치
@@ -160,9 +190,9 @@ export default function InventoryDashboard() {
       // 💡 [대전환] 명단에 없는 새로운 약품이거나 신규 등록이 필요할 때 등록 모달 자동 팝업 및 자동 기입
       alert(`[신규 의약품 감지]\n시스템 등록창을 자동으로 개설하고 스캔 데이터를 주입합니다.`);
       
-      if (mappedProduct) {
-        setNewName(mappedProduct.name);
-        setNewCategory(mappedProduct.category);
+      if (finalName) {
+        setNewName(finalName);
+        setNewCategory(finalCategory);
       } else {
         setNewName(`미등록 바코드 (${cleanBarcode})`);
         setNewCategory('의약품');
