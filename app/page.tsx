@@ -21,22 +21,36 @@ export default function InventoryDashboard() {
   const [inputValues, setInputValues] = useState<{ [key: number]: string }>({});
   const [isDeleteMode, setIsDeleteMode] = useState(false);
 
+  // 모달 상태
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [selectedItem, setSelectedItem] = useState<any>(null);
   const [targetStock, setTargetStock] = useState<number>(0);
 
+  // 등록 및 수정 모달
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [newName, setNewName] = useState('');
   const [newCategory, setNewCategory] = useState('의약품');
   const [newStock, setNewStock] = useState('0');
   const [newSafetyStock, setNewSafetyStock] = useState('50');
   const [newExpireDateInput, setNewExpireDateInput] = useState('');
-  
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [editName, setEditName] = useState('');
   const [isExpireModalOpen, setIsExpireModalOpen] = useState(false);
   const [expireDate, setExpireDate] = useState('');
   const [expireStock, setExpireStock] = useState('0');
+
+  // 💡 신설: 바코드 카메라 스캐너 상태 관리
+  const [isScannerOpen, setIsScannerOpen] = useState(false);
+  const [html5QrcodeScanner, setHtml5QrcodeScanner] = useState<any>(null);
+
+  // 💡 웹 브라우저용 글로벌 바코드 스캐너 스크립트 실시간 로드
+  useEffect(() => {
+    const script = document.createElement('script');
+    script.src = 'https://unpkg.com/html5-qrcode';
+    script.async = true;
+    document.body.appendChild(script);
+    return () => { document.body.removeChild(script); };
+  }, []);
 
   const fetchMainItems = async (search: string, mode: 'active' | 'all') => {
     let query = supabase.from('items').select('*').order('id', { ascending: false });
@@ -79,6 +93,67 @@ export default function InventoryDashboard() {
     return () => clearTimeout(delayDebounceFn);
   }, [leftSearch]);
 
+  // 💡 카메라 제어 엔진 가동 및 중지 로직
+  const startScanner = () => {
+    if (!window || !(window as any).Html5Qrcode) {
+      alert("바코드 스캐너 엔진이 아직 로딩 중입니다. 1초 뒤 다시 시도해 주세요.");
+      return;
+    }
+    setIsScannerOpen(true);
+    setTimeout(() => {
+      const scanner = new (window as any).Html5Qrcode("scanner-view");
+      setHtml5QrcodeScanner(scanner);
+      
+      scanner.start(
+        { facingMode: "environment" }, // 후면 카메라 우선 구동
+        { fps: 15, qrbox: { width: 280, height: 160 } }, // 바코드 맞춤 가로형 조준창
+        (decodedText: string) => {
+          // 🎉 스캔 성공 시 리액터 작동
+          handleBarcodeScanned(decodedText, scanner);
+        },
+        () => {} // 에러 발생 시 노이즈 스킵
+      ).catch(() => {});
+    }, 400);
+  };
+
+  const stopScanner = (scannerInstance = html5QrcodeScanner) => {
+    if (scannerInstance && scannerInstance.isScanning) {
+      scannerInstance.stop().then(() => {
+        setIsScannerOpen(false);
+        setHtml5QrcodeScanner(null);
+      }).catch(() => {
+        setIsScannerOpen(false);
+      });
+    } else {
+      setIsScannerOpen(false);
+    }
+  };
+
+  // 💡 스캔된 문자열 데이터 지능형 판독 파이프라인
+  const handleBarcodeScanned = (code: string, scanner: any) => {
+    stopScanner(scanner);
+    
+    // 1단계: 의료용 2D GS1 DataMatrix 표준 규격 해독 시도
+    // 전문약 바코드는 보통 대괄호나 특정 조합 분기(예: 17로 시작하는 6자리 유통기한)를 포함함
+    const expireRegex = /17(\d{2})(\d{2})(\d{2})/; // AI 17 패턴 매칭 (YYMMDD)
+    const match = code.match(expireRegex);
+
+    if (match) {
+      const year = `20${match[1]}`;
+      const month = match[2];
+      const day = match[3];
+      const autoParsedDate = `${year}-${month}-${day}`;
+
+      alert(`[의료용 2D 바코드 인지 완료]\n자동 추출된 시효기간: ${autoParsedDate}\n해당 품목을 창고에서 필터링합니다.`);
+      setLeftSearch(autoParsedDate); // 시효기간으로 검색창 원격 변환
+    } else {
+      // 2단계: 일반 1D 바코드의 경우 코드를 좌측 검색창에 바로 주입하여 품목 서칭
+      alert(`[일반 바코드 인식 완료]\n식별 번호: ${code}`);
+      setViewMode('all'); // 전역 검색 허용
+      setLeftSearch(code);
+    }
+  };
+
   const toggleActiveStatus = async (item: any) => {
     const newStatus = !item.is_active;
     setItems(prev => prev.map(i => i.id === item.id ? { ...i, is_active: newStatus } : i));
@@ -96,16 +171,13 @@ export default function InventoryDashboard() {
   const handleRelativeClick = async (item: any, change: number) => {
     const newStock = item.current_stock + change;
     if (newStock < 0) { alert("재고는 0개 미만으로 내려갈 수 없습니다."); return; }
-    
     setItems(prev => prev.map(i => i.id === item.id ? { ...i, current_stock: newStock } : i));
-    
     const { error } = await supabase.from('items').update({ current_stock: newStock }).eq('id', item.id);
     if (error) {
       setItems(prev => prev.map(i => i.id === item.id ? { ...i, current_stock: item.current_stock } : i));
       alert("수량 통신 오류: " + error.message);
       return;
     }
-
     if (change < 0) {
       const consumedQty = Math.abs(change);
       const { error: logError } = await supabase.from('inventory_logs').insert([{ item_name: item.name, quantity: consumedQty }]);
@@ -119,25 +191,15 @@ export default function InventoryDashboard() {
     if (!value || value.trim() === '') { alert("변경할 숫자를 입력해주세요."); return; }
     const parsedStock = parseInt(value, 10);
     if (isNaN(parsedStock) || parsedStock < 0) { alert("0 이상의 숫자만 입력 가능합니다."); return; }
-    
-    setSelectedItem(item);
-    setTargetStock(parsedStock);
-    setIsModalOpen(true);
+    setSelectedItem(item); setTargetStock(parsedStock); setIsModalOpen(true);
   };
 
   const handleConfirmChange = async () => {
     if (!selectedItem) return;
     setItems(prev => prev.map(i => i.id === selectedItem.id ? { ...i, current_stock: targetStock } : i));
-    
     const { error: itemError } = await supabase.from('items').update({ current_stock: targetStock }).eq('id', selectedItem.id);
-    if (itemError) {
-      alert("재고 수정 실패: " + itemError.message);
-      return;
-    }
-    setInputValues(prev => ({ ...prev, [selectedItem.id]: '' }));
-    setIsModalOpen(false);
-    setSelectedItem(null);
-    fetchShortageItems();
+    if (itemError) { alert("재고 수정 실패: " + itemError.message); return; }
+    setInputValues(prev => ({ ...prev, [selectedItem.id]: '' })); setIsModalOpen(false); setSelectedItem(null); fetchShortageItems();
   };
 
   const handleAddItem = async (e: React.FormEvent) => {
@@ -174,28 +236,17 @@ export default function InventoryDashboard() {
   const filteredShortageItems = shortageItems.filter(item => item.name.toLowerCase().includes(rightSearch.toLowerCase()));
   const filteredLogs = logs.filter(log => log.item_name.toLowerCase().includes(logSearch.toLowerCase()));
 
-  const formatKoreanDate = (isoString: string) => {
-    const d = new Date(isoString);
-    return `${d.getFullYear()}년 ${d.getMonth() + 1}월 ${d.getDate()}일 ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-  };
-
-  // 💡 신설: 시효기간 신호등 분석 엔진
   const getExpireStatus = (dateStr: string) => {
     if (!dateStr || dateStr.trim() === '') return { text: '미기입', classes: 'text-gray-400 bg-gray-900/60 border-gray-800' };
-    
     const expDate = new Date(dateStr);
     if (isNaN(expDate.getTime())) return { text: dateStr, classes: 'text-gray-400 bg-gray-900/60 border-gray-800' };
-
-    const today = new Date();
-    today.setHours(0, 0, 0, 0); // 시간 단위를 자정으로 통일하여 정확한 일수 계산
-    
+    const today = new Date(); today.setHours(0, 0, 0, 0);
     const diffTime = expDate.getTime() - today.getTime();
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)); // 남은 일수
-
-    if (diffDays < 0) return { text: `${dateStr} (만료)`, classes: 'text-white font-bold bg-red-600 border-red-500 animate-pulse' }; // 만료
-    if (diffDays < 180) return { text: dateStr, classes: 'text-red-400 font-bold bg-red-950/60 border-red-900/60' }; // 6개월(180일) 미만
-    if (diffDays < 365) return { text: dateStr, classes: 'text-yellow-400 font-bold bg-yellow-950/60 border-yellow-900/60' }; // 1년(365일) 미만
-    return { text: dateStr, classes: 'text-emerald-400 font-bold bg-emerald-950/60 border-emerald-900/60' }; // 1년 이상 남음
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    if (diffDays < 0) return { text: `${dateStr} (만료)`, classes: 'text-white font-bold bg-red-600 border-red-500 animate-pulse' };
+    if (diffDays < 180) return { text: dateStr, classes: 'text-red-400 font-bold bg-red-950/60 border-red-900/60' };
+    if (diffDays < 365) return { text: dateStr, classes: 'text-yellow-400 font-bold bg-yellow-950/60 border-yellow-900/60' };
+    return { text: dateStr, classes: 'text-emerald-400 font-bold bg-emerald-950/60 border-emerald-900/60' };
   };
 
   return (
@@ -205,9 +256,18 @@ export default function InventoryDashboard() {
       <div className="flex-1 p-4 lg:p-8 overflow-y-auto">
         <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-4 gap-3">
           <h1 className="text-xl lg:text-2xl font-bold text-white tracking-tight">전체 재고 관리 대시보드</h1>
-          <div className="flex space-x-2">
-            <button onClick={() => setIsAddModalOpen(true)} className="px-3 py-2 bg-blue-600 hover:bg-blue-500 font-bold rounded-lg text-white shadow-lg text-xs lg:text-sm whitespace-nowrap">+ 새 품목 등록</button>
-            <button onClick={() => setIsDeleteMode(!isDeleteMode)} className={`px-3 py-2 font-bold rounded-lg text-white text-xs lg:text-sm whitespace-nowrap transition-colors ${isDeleteMode ? 'bg-red-600 ring-2 ring-red-400' : 'bg-gray-800'}`}>{isDeleteMode ? '🚫 삭제 모드 종료' : '🗑️ 기존 품목 삭제'}</button>
+          
+          {/* 상단 통합 액션 그룹 */}
+          <div className="flex space-x-2 w-full sm:w-auto">
+            {/* 💡 신설: 바코드 스캔 카메라 버튼 부착 */}
+            <button 
+              onClick={startScanner}
+              className="flex-1 sm:flex-none px-3.5 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 font-black rounded-lg text-white shadow-lg text-xs lg:text-sm flex items-center justify-center border border-emerald-500/30"
+            >
+              <span className="mr-1.5">📷</span> 바코드 스캔
+            </button>
+            <button onClick={() => setIsAddModalOpen(true)} className="flex-1 sm:flex-none px-3 py-2 bg-blue-600 hover:bg-blue-500 font-bold rounded-lg text-white text-xs lg:text-sm">+ 새 품목 등록</button>
+            <button onClick={() => setIsDeleteMode(!isDeleteMode)} className={`px-3 py-2 font-bold rounded-lg text-white text-xs lg:text-sm transition-colors ${isDeleteMode ? 'bg-red-600 ring-2 ring-red-400' : 'bg-gray-800'}`}>{isDeleteMode ? '🚫 종료' : '🗑️ 삭제'}</button>
           </div>
         </div>
 
@@ -216,8 +276,9 @@ export default function InventoryDashboard() {
           <button onClick={() => setViewMode('all')} className={`px-3 py-1.5 lg:px-4 lg:py-2 rounded-md text-xs font-bold transition-all ${viewMode === 'all' ? 'bg-gray-800 text-white shadow border border-gray-700' : 'text-gray-400 hover:text-white'}`}>🌐 전체 창고 보기</button>
         </div>
         
-        <div className="mb-4 lg:mb-6">
-          <input type="text" placeholder={viewMode === 'active' ? "현재 취급 품목 실시간 검색..." : "식약처 전체 실시간 검색..."} className="w-full max-w-md p-2.5 lg:p-3 rounded-lg bg-[#111827] border border-gray-700 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition-colors shadow-inner text-sm" value={leftSearch} onChange={(e) => setLeftSearch(e.target.value)} />
+        <div className="mb-4 lg:mb-6 flex items-center space-x-2">
+          <input type="text" placeholder="검색 또는 바코드 스캔 번호 자동 주입..." className="w-full max-w-md p-2.5 lg:p-3 rounded-lg bg-[#111827] border border-gray-700 text-white text-sm focus:outline-none focus:border-blue-500" value={leftSearch} onChange={(e) => setLeftSearch(e.target.value)} />
+          {leftSearch && <button onClick={() => setLeftSearch('')} className="px-2.5 py-1.5 bg-gray-800 rounded text-xs text-gray-400">초기화</button>}
         </div>
 
         <div className="bg-[#111827] rounded-xl shadow-2xl border border-gray-800/80 p-3 lg:p-5 overflow-x-auto">
@@ -235,9 +296,7 @@ export default function InventoryDashboard() {
             </thead>
             <tbody>
               {items.map(item => {
-                // 💡 반복문 내에서 개별 아이템의 시효 상태를 계산
                 const expireStatus = getExpireStatus(item.expiration_date);
-
                 return (
                   <tr key={item.id} className={`border-b border-gray-800/60 hover:bg-gray-800/30 transition-all duration-150 group ${!item.is_active && 'opacity-50'}`}>
                     {isDeleteMode && (
@@ -252,17 +311,12 @@ export default function InventoryDashboard() {
                         <button onClick={() => { setSelectedItem(item); setEditName(item.name); setIsEditModalOpen(true); }} className="ml-2 opacity-100 lg:opacity-0 lg:group-hover:opacity-100 text-gray-400 hover:text-blue-400 p-1 rounded hover:bg-gray-800 bg-gray-800/50 lg:bg-transparent"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.8} stroke="currentColor" className="w-3.5 h-3.5"><path strokeLinecap="round" strokeLinejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L6.832 19.82a4.5 4.5 0 0 1-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 0 1 1.13-1.897L16.863 4.487Zm0 0L19.5 7.125" /></svg></button>
                       </div>
                     </td>
-                    
-                    {/* 💡 시효기간 배지에 신호등 시스템 동적 클래스 부여 */}
                     <td className="py-4 text-center">
                       <div className="flex flex-col items-center justify-center gap-1">
-                        <span className={`text-[11px] px-2 py-0.5 rounded border transition-colors ${expireStatus.classes}`}>
-                          {expireStatus.text}
-                        </span>
-                        {item.is_active && <button onClick={() => { setSelectedItem(item); setIsExpireModalOpen(true); }} className="text-[10px] bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-1.5 py-0.5 rounded border border-gray-700 transition-all font-medium mt-0.5">+ 기한 추가</button>}
+                        <span className={`text-[11px] px-2 py-0.5 rounded border transition-colors ${expireStatus.classes}`}>{expireStatus.text}</span>
+                        {item.is_active && <button onClick={() => { setSelectedItem(item); setIsExpireModalOpen(true); }} className="text-[10px] bg-gray-800 hover:bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded border border-gray-700 transition-all font-medium mt-0.5">+ 기한 추가</button>}
                       </div>
                     </td>
-                    
                     <td className="py-4 text-center">
                       <button onClick={() => toggleActiveStatus(item)} className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${item.is_active ? 'bg-blue-600' : 'bg-gray-700'}`}><span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${item.is_active ? 'translate-x-6' : 'translate-x-1'}`} /></button>
                     </td>
@@ -289,21 +343,19 @@ export default function InventoryDashboard() {
         </div>
       </div>
 
-      {/* 🔴 우측 탭 제어 피드 영역 */}
+      {/* 🔴 우측 탭 제어 피드 */}
       <div className="w-full lg:w-96 h-[45vh] lg:h-auto bg-[#111827] border-t lg:border-t-0 lg:border-l border-gray-800/80 p-4 lg:p-6 flex flex-col shadow-2xl shrink-0 z-10">
         <div className="flex space-x-1 bg-[#0B0F19] p-1 rounded-lg border border-gray-800 mb-4">
-          <button onClick={() => setRightTab('shortage')} className={`flex-1 py-2 text-center rounded-md text-xs font-black transition-all ${rightTab === 'shortage' ? 'bg-red-950/60 text-red-400 border border-red-900/40 shadow' : 'text-gray-500 hover:text-gray-300'}`}>🚨 긴급 보충</button>
-          <button onClick={() => setRightTab('logs')} className={`flex-1 py-2 text-center rounded-md text-xs font-black transition-all ${rightTab === 'logs' ? 'bg-blue-950/60 text-blue-400 border border-blue-900/40 shadow' : 'text-gray-500 hover:text-gray-300'}`}>📋 소모 로그 보드</button>
+          <button onClick={() => setRightTab('shortage')} className={`flex-1 py-2 text-center rounded-md text-xs font-black transition-all ${rightTab === 'shortage' ? 'bg-red-950/60 text-red-400 shadow' : 'text-gray-500'}`}>🚨 긴급 보충</button>
+          <button onClick={() => setRightTab('logs')} className={`flex-1 py-2 text-center rounded-md text-xs font-black transition-all ${rightTab === 'logs' ? 'bg-blue-950/60 text-blue-400 shadow' : 'text-gray-500'}`}>📋 소모 로그 보드</button>
         </div>
 
         {rightTab === 'shortage' && (
           <div className="flex flex-col flex-1 overflow-hidden">
-            <div className="mb-3"><input type="text" placeholder="부족 품목 중 검색..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs focus:outline-none focus:border-red-500" value={rightSearch} onChange={(e) => setRightSearch(e.target.value)} /></div>
+            <div className="mb-3"><input type="text" placeholder="부족 품목 중 검색..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs" value={rightSearch} onChange={(e) => setRightSearch(e.target.value)} /></div>
             <div className="flex-1 overflow-y-auto space-y-2.5 pr-1 scrollbar-thin">
               {filteredShortageItems.map(item => {
-                // 💡 피드에서도 신호등 컬러 연동
                 const expireStatus = getExpireStatus(item.expiration_date);
-
                 return (
                   <div key={item.id} className="bg-red-950/20 border border-red-900/50 p-3 rounded-xl flex flex-col shadow-md">
                     <span className="font-semibold text-red-200 text-sm mb-1.5">{item.name}</span>
@@ -315,36 +367,57 @@ export default function InventoryDashboard() {
                   </div>
                 );
               })}
-              {filteredShortageItems.length === 0 && <div className="text-center text-gray-500 mt-10 text-xs">부족 품목 목록이 비어있습니다.</div>}
             </div>
           </div>
         )}
 
         {rightTab === 'logs' && (
           <div className="flex flex-col flex-1 overflow-hidden">
-            <div className="mb-3"><input type="text" placeholder="로그 기록 내품목 검색..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs focus:outline-none focus:border-blue-500" value={logSearch} onChange={(e) => setLogSearch(e.target.value)} /></div>
+            <div className="mb-3"><input type="text" placeholder="로그 기록 내품목 검색..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs" value={logSearch} onChange={(e) => setLogSearch(e.target.value)} /></div>
             <div className="flex-1 overflow-y-auto space-y-2 pr-1 scrollbar-thin">
               {filteredLogs.map(log => (
                 <div key={log.id} className="bg-blue-950/10 border border-blue-950/60 p-3 rounded-xl shadow-sm flex flex-col border-l-4 border-l-blue-500">
                   <span className="text-[11px] text-gray-400 font-medium mb-1">{formatKoreanDate(log.created_at)}</span>
                   <div className="flex justify-between items-start">
                     <span className="text-white text-xs font-semibold max-w-[180px] truncate">{log.item_name}</span>
-                    <span className="text-red-400 font-bold text-xs bg-red-950/30 px-2 py-0.5 rounded border border-red-900/20 shrink-0">-{log.quantity}개 소모</span>
+                    <span className="text-red-400 font-bold text-xs bg-red-950/30 px-2 py-0.5 rounded border border-red-900/20">-{log.quantity}개 소모</span>
                   </div>
                 </div>
               ))}
-              {filteredLogs.length === 0 && <div className="text-center text-gray-500 mt-10 text-xs">소모 처리 이력이 존재하지 않습니다.</div>}
             </div>
           </div>
         )}
       </div>
 
+      {/* 💡 신설: 실시간 모바일 카메라 뷰 파인더 팝업 오버레이 */}
+      {isScannerOpen && (
+        <div className="fixed inset-0 bg-black/95 flex flex-col items-center justify-center z-50 p-4 backdrop-blur-md animate-fade-in">
+          <div className="bg-[#111827] border border-gray-800 rounded-3xl p-4 max-w-md w-full flex flex-col shadow-2xl">
+            <div className="flex justify-between items-center pb-3 border-b border-gray-800 mb-3">
+              <h3 className="text-sm font-black text-emerald-400 flex items-center">
+                <span className="w-2 h-2 bg-emerald-500 rounded-full mr-2 animate-ping"></span>
+                실시간 바코드 스캐너 가동 중
+              </h3>
+              <button type="button" onClick={() => stopScanner()} className="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded-lg font-bold text-gray-400 hover:text-white">닫기</button>
+            </div>
+            
+            {/* 카메라 화면이 출력될 사각 프레임 타겟 지점 */}
+            <div id="scanner-view" className="w-full bg-black rounded-2xl overflow-hidden border border-gray-800 shadow-inner min-h-[240px]"></div>
+            
+            <p className="text-[11px] text-gray-500 mt-3 text-center leading-relaxed">
+              약 상자의 바코드(1D) 또는 네모난 의료용 바코드(GS1)를<br />중앙 녹색 조준창에 가까이 대주세요. 자동으로 해독됩니다.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* 기존 팝업 모달 리스트 */}
       {isExpireModalOpen && selectedItem && (
         <div className="fixed inset-0 bg-black/85 flex items-center justify-center z-50 p-4 backdrop-blur-md">
           <form onSubmit={handleAddExpiration} className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-sm w-full space-y-4 shadow-2xl">
             <h3 className="text-sm font-bold text-yellow-400 pb-2 border-b border-gray-800">⏳ 시효기간별 품목 분할 등록</h3>
             <p className="text-xs text-gray-400">선택 약품: <span className="text-white font-bold">{selectedItem.name}</span></p>
-            <div><label className="block text-[11px] text-gray-400 mb-1">새로운 시효기간 (YYYY-MM-DD 권장)</label><input type="text" required placeholder="예: 2026-12-31" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm" value={expireDate} onChange={(e) => setExpireDate(e.target.value)} /></div>
+            <div><label className="block text-[11px] text-gray-400 mb-1">새로운 시효기간 입력 (YYYY-MM-DD)</label><input type="text" required placeholder="예: 2026-12-31" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm" value={expireDate} onChange={(e) => setExpireDate(e.target.value)} /></div>
             <div><label className="block text-[11px] text-gray-400 mb-1">초기 수량</label><input type="number" min="0" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm text-center" value={expireStock} onChange={(e) => setExpireStock(e.target.value)} /></div>
             <div className="flex space-x-2 justify-end pt-2 border-t border-gray-800"><button type="button" onClick={() => { setIsExpireModalOpen(false); setSelectedItem(null); }} className="px-3 py-1.5 bg-gray-800 text-xs rounded">취소</button><button type="submit" className="px-3 py-1.5 bg-yellow-600 text-xs text-white rounded font-bold">분리 등록 완료</button></div>
           </form>
@@ -357,7 +430,7 @@ export default function InventoryDashboard() {
             <h3 className="text-base font-bold text-white pb-3 border-b border-gray-800">📦 시스템 새 품목 등록</h3>
             <div><label className="block text-xs text-gray-400 mb-1">품목명</label><input type="text" required placeholder="예: 아목시실린 500mg" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm" value={newName} onChange={(e) => setNewName(e.target.value)} /></div>
             <div className="grid grid-cols-2 gap-2">
-              <div><label className="block text-xs text-gray-400 mb-1">초기 시효기간 (선택)</label><input type="text" placeholder="예: 2027-05-20" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm" value={newExpireDateInput} onChange={(e) => setNewExpireDateInput(e.target.value)} /></div>
+              <div><label className="block text-xs text-gray-400 mb-1">초기 시효기간</label><input type="text" placeholder="예: 2027-05-20" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm" value={newExpireDateInput} onChange={(e) => setNewExpireDateInput(e.target.value)} /></div>
               <div><label className="block text-xs text-gray-400 mb-1">분류</label><select className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm" value={newCategory} onChange={(e) => setNewCategory(e.target.value)}><option value="의약품">의약품</option><option value="의료기재">의료기재</option></select></div>
             </div>
             <div className="grid grid-cols-2 gap-2">
