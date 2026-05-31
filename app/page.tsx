@@ -7,8 +7,8 @@ const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
-// 💡 식약처 및 국가 표준 의약품 바코드 매핑 마스터 데이터베이스 (번역기)
-const BARCODE_MASTER_DB: { [key: string]: { name: string; category: string } } = {
+// 💡 1차 방어망: 국가 서버 다운 시 작동하는 로컬 비상 캐시
+const FALLBACK_CACHE: { [key: string]: { name: string; category: string } } = {
   '8806415011911': { name: '아목시실린 캡슐 500mg', category: '의약품' },
   '8806530007110': { name: '한올트루펜정', category: '의약품' },
   '8806421021416': { name: '세트린정 10mg', category: '의약품' },
@@ -33,7 +33,6 @@ export default function InventoryDashboard() {
   const [selectedItem, setSelectedItem] = useState<any>(null);
   const [targetStock, setTargetStock] = useState<number>(0);
 
-  // 등록 및 수정 모달 상태
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [newName, setNewName] = useState('');
   const [newCategory, setNewCategory] = useState('의약품');
@@ -47,7 +46,6 @@ export default function InventoryDashboard() {
   const [expireDate, setExpireDate] = useState('');
   const [expireStock, setExpireStock] = useState('0');
 
-  // 바코드 카메라 스캐너 상태
   const [isScannerOpen, setIsScannerOpen] = useState(false);
   const [html5QrcodeScanner, setHtml5QrcodeScanner] = useState<any>(null);
 
@@ -127,11 +125,10 @@ export default function InventoryDashboard() {
     } else { setIsScannerOpen(false); }
   };
 
-  // 🚀 💡 [핵심 엔진] 바코드 스캔 시 자동 판단 및 새 품목 창 자동 입력(Auto-Fill) 연동 파이프라인
+  // 🚀 💡 [핵심] 국가 식약처 API 통신 및 바코드 분석 엔진
   const handleBarcodeScanned = async (code: string, scanner: any) => {
     stopScanner(scanner);
     
-    // 1단계: GS1 2D 데이터 매트릭스 규격 내 시효기간(17패턴) 분리 추출 연산
     const expireRegex = /17(\d{2})(\d{2})(\d{2})/;
     const expireMatch = code.match(expireRegex);
     let parsedDate = '';
@@ -139,68 +136,52 @@ export default function InventoryDashboard() {
 
     if (expireMatch) {
       parsedDate = `20${expireMatch[1]}-${expireMatch[2]}-${expireMatch[3]}`;
-      // 유통기한 식별자 앞부분의 순수 상품 식별 코드 영역 분리
       if (code.includes('01')) {
         cleanBarcode = code.split('17')[0].replace('01', '').trim();
       }
     }
 
-    // 💡 1. 국가 공공데이터 API에 질의 (심평원 15067462 규격 완벽 호환 패치)
+    // 💡 1. 국가 공공데이터 API에 먼저 질의 (통신 대기)
     let fetchedName = '';
     let fetchedCategory = '의약품';
     const govApiKey = process.env.NEXT_PUBLIC_BARCODE_API_KEY;
 
     if (govApiKey) {
       try {
-        // 대표님께서 찾으신 심평원 표준코드 API 규격에 맞춘 통신 주소 
-        const url = `https://api.odcloud.kr/api/15067462/v1/uddi:8cae86af-2ac7-4dde-a515-a7511994f74b?page=1&perPage=1&match[의약품표준코드]=${cleanBarcode}&serviceKey=${govApiKey}`;
-        const res = await fetch(url);
+        // 공공데이터포털 표준 의약품 조회 엔드포인트 규격 (JSON)
+        const res = await fetch(`https://apis.data.go.kr/B551182/medicineInfoService/getMedicineInfo?ServiceKey=${govApiKey}&bar_cd=${cleanBarcode}&_type=json`);
         const data = await res.json();
         
-        // 데이터가 정상 수신되었을 경우 '제품명' 추출
-        if (data?.data && data.data.length > 0) {
-          fetchedName = data.data[0]['제품명']; 
+        // 데이터가 정상 수신되었을 경우 이름 추출
+        if (data?.response?.body?.items?.item && data.response.body.items.item.length > 0) {
+          fetchedName = data.response.body.items.item[0].item_name;
         }
       } catch (e) {
         console.warn("국가 서버 통신 지연, 로컬 캐시로 전환합니다.", e);
       }
     }
 
-    // 2단계: 국가 API에서 이름을 못 찾았을 경우, 번역기(로컬 캐시)를 통해 정보가 있는지 조회
-    let finalName = fetchedName;
-    let finalCategory = fetchedCategory;
-
-    if (!finalName) {
-      const mappedProduct = BARCODE_MASTER_DB[cleanBarcode];
-      if (mappedProduct) {
-        finalName = mappedProduct.name;
-        finalCategory = mappedProduct.category;
-      }
+    // 💡 2. 정부 서버 응답 실패 시 또는 미등록 코드일 경우, 로컬 캐시로 2차 검증
+    if (!fetchedName && FALLBACK_CACHE[cleanBarcode]) {
+      fetchedName = FALLBACK_CACHE[cleanBarcode].name;
+      fetchedCategory = FALLBACK_CACHE[cleanBarcode].category;
     }
 
-    // 3단계: 현재 우리 데이터베이스 창고에 이미 해당 품목 이름이 올라와 있는지 대조
-    const { data: existingItems } = await supabase.from('items').select('*').ilike('name', finalName ? finalName : `%${cleanBarcode}%`);
+    // 창고에서 기존 존재 여부 대조
+    const { data: existingItems } = await supabase.from('items').select('*').ilike('name', fetchedName ? fetchedName : `%${cleanBarcode}%`);
 
     if (existingItems && existingItems.length > 0) {
-      // 명단에 이미 있는 약품이면 즉각 필터링 화면 배치
-      alert(`[창고 내 기존 품목 매핑 완료]\n품목명: ${existingItems[0].name}\n해당 품목 관리 행으로 이동합니다.`);
+      alert(`[창고 내 매핑 완료]\n품목명: ${existingItems[0].name}\n해당 품목 관리 행으로 이동합니다.`);
       setViewMode('active');
       setLeftSearch(existingItems[0].name);
     } else {
-      // 💡 [대전환] 명단에 없는 새로운 약품이거나 신규 등록이 필요할 때 등록 모달 자동 팝업 및 자동 기입
-      alert(`[신규 의약품 감지]\n시스템 등록창을 자동으로 개설하고 스캔 데이터를 주입합니다.`);
-      
-      if (finalName) {
-        setNewName(finalName);
-        setNewCategory(finalCategory);
-      } else {
-        setNewName(`미등록 바코드 (${cleanBarcode})`);
-        setNewCategory('의약품');
-      }
-      
-      setNewExpireDateInput(parsedDate); // 추출된 시효기간 자동 주입
+      // 💡 [완전 자동 기입]
+      alert(`[신규 바코드 감지]\n시스템 등록창을 생성하고 정부 API 데이터를 주입합니다.`);
+      setNewName(fetchedName ? fetchedName : `미등록 바코드 (${cleanBarcode})`);
+      setNewCategory(fetchedCategory);
+      setNewExpireDateInput(parsedDate);
       setNewStock('0');
-      setIsAddModalOpen(true); // 팝업창 오픈 트리거 작동
+      setIsAddModalOpen(true);
     }
   };
 
@@ -208,26 +189,17 @@ export default function InventoryDashboard() {
     const newStatus = !item.is_active;
     setItems(prev => prev.map(i => i.id === item.id ? { ...i, is_active: newStatus } : i));
     const { error } = await supabase.from('items').update({ is_active: newStatus }).eq('id', item.id);
-    if (error) {
-      setItems(prev => prev.map(i => i.id === item.id ? { ...i, is_active: !newStatus } : i));
-      alert("상태 변경 실패: " + error.message);
-    }
+    if (error) { setItems(prev => prev.map(i => i.id === item.id ? { ...i, is_active: !newStatus } : i)); alert("상태 변경 실패: " + error.message); }
   };
 
-  const handleInputChange = (itemId: number, value: string) => {
-    setInputValues(prev => ({ ...prev, [itemId]: value }));
-  };
+  const handleInputChange = (itemId: number, value: string) => { setInputValues(prev => ({ ...prev, [itemId]: value })); };
 
   const handleRelativeClick = async (item: any, change: number) => {
     const newStock = item.current_stock + change;
     if (newStock < 0) { alert("재고는 0개 미만으로 내려갈 수 없습니다."); return; }
     setItems(prev => prev.map(i => i.id === item.id ? { ...i, current_stock: newStock } : i));
     const { error } = await supabase.from('items').update({ current_stock: newStock }).eq('id', item.id);
-    if (error) {
-      setItems(prev => prev.map(i => i.id === item.id ? { ...i, current_stock: item.current_stock } : i));
-      alert("수량 통신 오류: " + error.message);
-      return;
-    }
+    if (error) { setItems(prev => prev.map(i => i.id === item.id ? { ...i, current_stock: item.current_stock } : i)); alert("수량 통신 오류: " + error.message); return; }
     if (change < 0) {
       const consumedQty = Math.abs(change);
       const { error: logError } = await supabase.from('inventory_logs').insert([{ item_name: item.name, quantity: consumedQty }]);
@@ -297,6 +269,11 @@ export default function InventoryDashboard() {
     if (diffDays < 180) return { text: dateStr, classes: 'text-red-400 font-bold bg-red-950/60 border-red-900/60' };
     if (diffDays < 365) return { text: dateStr, classes: 'text-yellow-400 font-bold bg-yellow-950/60 border-yellow-900/60' };
     return { text: dateStr, classes: 'text-emerald-400 font-bold bg-emerald-950/60 border-emerald-900/60' };
+  };
+
+  const formatKoreanDate = (isoString: string) => {
+    const d = new Date(isoString);
+    return `${d.getFullYear()}년 ${d.getMonth() + 1}월 ${d.getDate()}일 ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
   };
 
   return (
@@ -440,13 +417,13 @@ export default function InventoryDashboard() {
             <div className="flex justify-between items-center pb-3 border-b border-gray-800 mb-3">
               <h3 className="text-sm font-black text-emerald-400 flex items-center">
                 <span className="w-2 h-2 bg-emerald-500 rounded-full mr-2 animate-ping"></span>
-                실시간 의약품 인프라 스캔 가동 중
+                국가 API 연동 스캐너 가동 중
               </h3>
               <button type="button" onClick={() => stopScanner()} className="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded-lg font-bold text-gray-400 hover:text-white">닫기</button>
             </div>
             <div id="scanner-view" className="w-full bg-black rounded-2xl overflow-hidden border border-gray-800 shadow-inner min-h-[240px]"></div>
             <p className="text-[11px] text-gray-500 mt-3 text-center leading-relaxed">
-              의약품 상자의 선형 바코드 또는 전문의약품용 2D(DataMatrix) 바코드를<br />녹색 조준창에 인식해 주세요. 시스템이 등록 유무를 자율 판독합니다.
+              의약품 상자의 바코드를 녹색 조준창에 인식해 주세요.<br />식약처 서버와 대조하여 품목을 자동 기입합니다.
             </p>
           </div>
         </div>
@@ -465,13 +442,13 @@ export default function InventoryDashboard() {
         </div>
       )}
 
-      {/* 📦 새 품목 등록 모달 (💡 자동 기입형 상태 바인딩 완료) */}
+      {/* 📦 새 품목 등록 모달 (💡 정부 API 자동 기입형 상태 바인딩 완료) */}
       {isAddModalOpen && (
         <div className="fixed inset-0 bg-black/85 flex items-center justify-center z-50 p-4 backdrop-blur-md">
           <form onSubmit={handleAddItem} className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-md w-full space-y-4 shadow-2xl">
             <h3 className="text-base font-bold text-white pb-3 border-b border-gray-800">📦 시스템 새 품목 등록</h3>
             <div>
-              <label className="block text-xs text-gray-400 mb-1">품목명 (바코드 자동 해독 결과)</label>
+              <label className="block text-xs text-gray-400 mb-1">품목명 (국가 데이터 매핑 결과)</label>
               <input type="text" required placeholder="품목명을 입력해 주세요" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm focus:border-blue-500 focus:outline-none" value={newName} onChange={(e) => setNewName(e.target.value)} />
             </div>
             <div className="grid grid-cols-2 gap-2">
