@@ -143,27 +143,17 @@ export default function InventoryDashboard() {
     let fetchedCategory = '의약품';
     const govApiKey = process.env.NEXT_PUBLIC_BARCODE_API_KEY;
 
-    // 💡 핵심 패치: 한글 URL 깨짐 방지 및 공공 API 키 안전 인코딩
     if (govApiKey) {
       try {
         const encodedParam = encodeURIComponent('match[의약품표준코드]');
         const safeApiKey = govApiKey.includes('%') ? govApiKey : encodeURIComponent(govApiKey);
-        
         const url = `https://api.odcloud.kr/api/15067462/v1/uddi:8cae86af-2ac7-4dde-a515-a7511994f74b?page=1&perPage=1&${encodedParam}=${cleanBarcode}&serviceKey=${safeApiKey}`;
-        
         const res = await fetch(url);
-        
         if (res.ok) {
           const data = await res.json();
-          if (data?.data && data.data.length > 0) {
-            fetchedName = data.data[0]['제품명']; 
-          }
-        } else {
-          console.error("국가 API 통신 거부 (상태코드):", res.status);
+          if (data?.data && data.data.length > 0) fetchedName = data.data[0]['제품명']; 
         }
-      } catch (e) {
-        console.warn("국가 API 서버 지연 에러:", e);
-      }
+      } catch (e) { console.warn(e); }
     }
 
     if (!fetchedName && FALLBACK_CACHE[cleanBarcode]) {
@@ -201,7 +191,8 @@ export default function InventoryDashboard() {
     if (newStock < 0) { alert("재고는 0개 미만으로 내려갈 수 없습니다."); return; }
     setItems(prev => prev.map(i => i.id === item.id ? { ...i, current_stock: newStock } : i));
     const { error } = await supabase.from('items').update({ current_stock: newStock }).eq('id', item.id);
-    if (error) { setItems(prev => prev.map(i => i.id === item.id ? { ...i, current_stock: item.current_stock } : i)); alert("수량 통신 오류: " + error.message); return; }
+    if (error) { setItems(prev => prev.map(i => i.id === item.id ? { ...i, current_stock: item.current_stock } : i)); return; }
+    
     if (change < 0) {
       const consumedQty = Math.abs(change);
       const { error: logError } = await supabase.from('inventory_logs').insert([{ item_name: item.name, quantity: consumedQty }]);
@@ -210,20 +201,51 @@ export default function InventoryDashboard() {
     fetchShortageItems();
   };
 
+  // 💡 [핵심] 스마트 기호 인식 엔진 (+, - 대량 계산)
   const handleAbsoluteClick = (item: any) => {
     const value = inputValues[item.id];
-    if (!value || value.trim() === '') { alert("변경할 숫자를 입력해주세요."); return; }
-    const parsedStock = parseInt(value, 10);
-    if (isNaN(parsedStock) || parsedStock < 0) { alert("0 이상의 숫자만 입력 가능합니다."); return; }
-    setSelectedItem(item); setTargetStock(parsedStock); setIsModalOpen(true);
+    if (!value || value.trim() === '') { alert("변경할 수량을 입력해주세요."); return; }
+
+    const strValue = value.trim();
+    let parsedTarget = 0;
+
+    if (strValue.startsWith('+') || strValue.startsWith('-')) {
+      const relativeVal = parseInt(strValue, 10);
+      if (isNaN(relativeVal)) { alert("올바른 숫자를 입력해주세요."); return; }
+      parsedTarget = item.current_stock + relativeVal;
+    } else {
+      parsedTarget = parseInt(strValue, 10);
+      if (isNaN(parsedTarget)) { alert("숫자만 입력 가능합니다."); return; }
+    }
+
+    if (parsedTarget < 0) { alert("결과 재고가 0개 미만으로 내려갈 수 없습니다."); return; }
+
+    setSelectedItem(item);
+    setTargetStock(parsedTarget);
+    setIsModalOpen(true);
   };
 
+  // 💡 [핵심] 변동량 차이(diff)를 계산하여 모든 소모 내역을 로그 보드에 자동 기록
   const handleConfirmChange = async () => {
     if (!selectedItem) return;
+    
+    const diff = targetStock - selectedItem.current_stock;
+    
     setItems(prev => prev.map(i => i.id === selectedItem.id ? { ...i, current_stock: targetStock } : i));
     const { error: itemError } = await supabase.from('items').update({ current_stock: targetStock }).eq('id', selectedItem.id);
     if (itemError) { alert("재고 수정 실패: " + itemError.message); return; }
-    setInputValues(prev => ({ ...prev, [selectedItem.id]: '' })); setIsModalOpen(false); setSelectedItem(null); fetchShortageItems();
+
+    // 마이너스 변동(출고)이 발생했을 때만 로그 테이블에 기록
+    if (diff < 0) {
+      const consumedQty = Math.abs(diff);
+      const { error: logError } = await supabase.from('inventory_logs').insert([{ item_name: selectedItem.name, quantity: consumedQty }]);
+      if (!logError) fetchLogs();
+    }
+
+    setInputValues(prev => ({ ...prev, [selectedItem.id]: '' }));
+    setIsModalOpen(false);
+    setSelectedItem(null);
+    fetchShortageItems();
   };
 
   const handleAddItem = async (e: React.FormEvent) => {
@@ -352,7 +374,8 @@ export default function InventoryDashboard() {
                         </div>
                         <span className="text-gray-700 font-light">/</span>
                         <div className="flex items-center space-x-1.5">
-                          <input type="number" min="0" placeholder="대량" disabled={!item.is_active} className="w-16 p-1.5 text-center rounded bg-[#0B0F19] border border-gray-700 text-white text-xs" value={inputValues[item.id] || ''} onChange={(e) => handleInputChange(item.id, e.target.value)} />
+                          {/* 💡 입력 필드: 이제 텍스트 타입으로 변경되어 + 또는 - 타이핑이 완전히 자유롭습니다. */}
+                          <input type="text" placeholder="+/-수량" disabled={!item.is_active} className="w-16 p-1.5 text-center rounded bg-[#0B0F19] border border-gray-700 text-white text-xs focus:outline-none focus:border-blue-500" value={inputValues[item.id] || ''} onChange={(e) => handleInputChange(item.id, e.target.value)} />
                           <button onClick={() => handleAbsoluteClick(item)} disabled={!item.is_active} className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 text-xs font-bold rounded text-white transition-colors disabled:opacity-30">적용</button>
                         </div>
                       </div>
@@ -412,26 +435,19 @@ export default function InventoryDashboard() {
         )}
       </div>
 
-      {/* 실시간 모바일 카메라 뷰 파인더 팝업 */}
       {isScannerOpen && (
         <div className="fixed inset-0 bg-black/95 flex flex-col items-center justify-center z-50 p-4 backdrop-blur-md animate-fade-in">
           <div className="bg-[#111827] border border-gray-800 rounded-3xl p-4 max-w-md w-full flex flex-col shadow-2xl">
             <div className="flex justify-between items-center pb-3 border-b border-gray-800 mb-3">
-              <h3 className="text-sm font-black text-emerald-400 flex items-center">
-                <span className="w-2 h-2 bg-emerald-500 rounded-full mr-2 animate-ping"></span>
-                국가 API 연동 스캐너 가동 중
-              </h3>
+              <h3 className="text-sm font-black text-emerald-400 flex items-center"><span className="w-2 h-2 bg-emerald-500 rounded-full mr-2 animate-ping"></span>국가 API 연동 스캐너 가동 중</h3>
               <button type="button" onClick={() => stopScanner()} className="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded-lg font-bold text-gray-400 hover:text-white">닫기</button>
             </div>
             <div id="scanner-view" className="w-full bg-black rounded-2xl overflow-hidden border border-gray-800 shadow-inner min-h-[240px]"></div>
-            <p className="text-[11px] text-gray-500 mt-3 text-center leading-relaxed">
-              의약품 상자의 바코드를 녹색 조준창에 인식해 주세요.<br />식약처 서버와 대조하여 품목을 자동 기입합니다.
-            </p>
+            <p className="text-[11px] text-gray-500 mt-3 text-center leading-relaxed">의약품 상자의 바코드를 녹색 조준창에 인식해 주세요.<br />식약처 서버와 대조하여 품목을 자동 기입합니다.</p>
           </div>
         </div>
       )}
 
-      {/* 시효기간별 품목 분할 등록 모달 */}
       {isExpireModalOpen && selectedItem && (
         <div className="fixed inset-0 bg-black/85 flex items-center justify-center z-50 p-4 backdrop-blur-md">
           <form onSubmit={handleAddExpiration} className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-sm w-full space-y-4 shadow-2xl">
@@ -444,38 +460,24 @@ export default function InventoryDashboard() {
         </div>
       )}
 
-      {/* 📦 새 품목 등록 모달 */}
       {isAddModalOpen && (
         <div className="fixed inset-0 bg-black/85 flex items-center justify-center z-50 p-4 backdrop-blur-md">
           <form onSubmit={handleAddItem} className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-md w-full space-y-4 shadow-2xl">
             <h3 className="text-base font-bold text-white pb-3 border-b border-gray-800">📦 시스템 새 품목 등록</h3>
-            <div>
-              <label className="block text-xs text-gray-400 mb-1">품목명 (국가 데이터 매핑 결과)</label>
-              <input type="text" required placeholder="품목명을 입력해 주세요" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm focus:border-blue-500 focus:outline-none" value={newName} onChange={(e) => setNewName(e.target.value)} />
-            </div>
+            <div><label className="block text-xs text-gray-400 mb-1">품목명 (국가 데이터 매핑 결과)</label><input type="text" required placeholder="품목명을 입력해 주세요" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm focus:border-blue-500 focus:outline-none" value={newName} onChange={(e) => setNewName(e.target.value)} /></div>
             <div className="grid grid-cols-2 gap-2">
-              <div>
-                <label className="block text-xs text-gray-400 mb-1">시효기간 (2D 바코드 주입)</label>
-                <input type="text" placeholder="예: 2027-05-20" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm focus:border-blue-500 focus:outline-none" value={newExpireDateInput} onChange={(e) => setNewExpireDateInput(e.target.value)} />
-              </div>
-              <div>
-                <label className="block text-xs text-gray-400 mb-1">분류</label>
-                <select className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm focus:border-blue-500 focus:outline-none" value={newCategory} onChange={(e) => setNewCategory(e.target.value)}><option value="의약품">의약품</option><option value="의료기재">의료기재</option></select>
-              </div>
+              <div><label className="block text-xs text-gray-400 mb-1">시효기간 (2D 바코드 주입)</label><input type="text" placeholder="예: 2027-05-20" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm focus:border-blue-500 focus:outline-none" value={newExpireDateInput} onChange={(e) => setNewExpireDateInput(e.target.value)} /></div>
+              <div><label className="block text-xs text-gray-400 mb-1">분류</label><select className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm focus:border-blue-500 focus:outline-none" value={newCategory} onChange={(e) => setNewCategory(e.target.value)}><option value="의약품">의약품</option><option value="의료기재">의료기재</option></select></div>
             </div>
             <div className="grid grid-cols-2 gap-2">
               <div><label className="block text-xs text-gray-400 mb-1">초기 입고 수량</label><input type="number" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm text-center" value={newStock} onChange={(e) => setNewStock(e.target.value)} /></div>
               <div><label className="block text-xs text-gray-400 mb-1">안전재고 임계값</label><input type="number" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm text-center" value={newSafetyStock} onChange={(e) => setNewSafetyStock(e.target.value)} /></div>
             </div>
-            <div className="flex space-x-2 justify-end pt-2 border-t border-gray-800">
-              <button type="button" onClick={() => setIsAddModalOpen(false)} className="px-4 py-2 bg-gray-800 text-xs text-white rounded hover:bg-gray-700">취소</button>
-              <button type="submit" className="px-4 py-2 bg-blue-600 text-xs text-white rounded font-bold hover:bg-blue-500">등록 완료</button>
-            </div>
+            <div className="flex space-x-2 justify-end pt-2 border-t border-gray-800"><button type="button" onClick={() => setIsAddModalOpen(false)} className="px-4 py-2 bg-gray-800 text-xs text-white rounded hover:bg-gray-700">취소</button><button type="submit" className="px-4 py-2 bg-blue-600 text-xs text-white rounded font-bold hover:bg-blue-500">등록 완료</button></div>
           </form>
         </div>
       )}
 
-      {/* 명칭 변경 모달 */}
       {isEditModalOpen && selectedItem && (
         <div className="fixed inset-0 bg-black/85 flex items-center justify-center z-50 p-4 backdrop-blur-md">
           <form onSubmit={handleUpdateName} className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-sm w-full space-y-4">
@@ -486,16 +488,43 @@ export default function InventoryDashboard() {
         </div>
       )}
 
-      {/* 대량 재고 변경 승인 모달 */}
-      {isModalOpen && selectedItem && (
-         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
-          <div className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-sm w-full">
-            <h3 className="text-sm font-bold text-white mb-2">⚠️ 대량 재고 변경 확인</h3>
-            <p className="text-xs text-gray-400">[{selectedItem.name}] 수량을 {targetStock}개로 강제 동기화합니까?</p>
-            <div className="flex space-x-2 justify-end mt-4"><button onClick={() => setIsModalOpen(false)} className="px-3 py-1.5 bg-gray-800 text-xs text-white rounded">취소</button><button onClick={handleConfirmChange} className="px-3 py-1.5 bg-blue-600 text-xs text-white rounded">변경 승인</button></div>
+      {/* 💡 [대형 팝업 업데이트] 대량 재고 변경 시뮬레이션 및 확인 모달 */}
+      {isModalOpen && selectedItem && (() => {
+        const diff = targetStock - selectedItem.current_stock;
+        const diffColor = diff > 0 ? 'text-green-400' : diff < 0 ? 'text-red-400' : 'text-gray-400';
+        const diffText = diff > 0 ? `+${diff}` : diff;
+        
+        return (
+          <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
+            <div className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-sm w-full shadow-2xl">
+              <h3 className="text-sm font-bold text-white mb-3">⚠️ 대량 재고 변경 확인</h3>
+              <p className="text-xs text-gray-400 mb-4">선택 품목: <span className="text-white font-bold">{selectedItem.name}</span></p>
+              
+              <div className="bg-[#0B0F19] p-4 rounded-xl flex justify-between items-center border border-gray-700 mb-5 shadow-inner">
+                <div className="text-center">
+                  <p className="text-[10px] text-gray-500 mb-1">현재고</p>
+                  <p className="text-lg font-bold text-gray-300">{selectedItem.current_stock}</p>
+                </div>
+                <div className="text-center flex flex-col items-center justify-center px-4">
+                  <p className="text-[10px] text-gray-500 mb-1">변동량</p>
+                  <p className={`text-base font-black bg-gray-900 px-3 py-0.5 rounded-full border border-gray-800 ${diffColor}`}>
+                    {diffText}
+                  </p>
+                </div>
+                <div className="text-center">
+                  <p className="text-[10px] text-gray-500 mb-1">최종 수량</p>
+                  <p className="text-lg font-black text-yellow-400">{targetStock}</p>
+                </div>
+              </div>
+
+              <div className="flex space-x-2 justify-end">
+                <button onClick={() => setIsModalOpen(false)} className="px-4 py-2 bg-gray-800 text-xs text-white rounded hover:bg-gray-700 font-bold">취소</button>
+                <button onClick={handleConfirmChange} className="px-4 py-2 bg-blue-600 text-xs text-white rounded hover:bg-blue-500 font-bold shadow-lg shadow-blue-900/50">변경 승인</button>
+              </div>
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
     </div>
   );
 }
