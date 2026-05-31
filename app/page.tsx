@@ -7,7 +7,6 @@ const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
-// 💡 1차 방어망: 국가 서버 다운 시 작동하는 로컬 비상 캐시
 const FALLBACK_CACHE: { [key: string]: { name: string; category: string } } = {
   '8806415011911': { name: '아목시실린 캡슐 500mg', category: '의약품' },
   '8806530007110': { name: '한올트루펜정', category: '의약품' },
@@ -125,7 +124,6 @@ export default function InventoryDashboard() {
     } else { setIsScannerOpen(false); }
   };
 
-  // 🚀 💡 [핵심] 국가 식약처 API 통신 및 바코드 분석 엔진
   const handleBarcodeScanned = async (code: string, scanner: any) => {
     stopScanner(scanner);
     
@@ -141,43 +139,46 @@ export default function InventoryDashboard() {
       }
     }
 
-    // 💡 1. 국가 공공데이터 API에 질의 (심평원 15067462 규격 완벽 호환 패치)
     let fetchedName = '';
     let fetchedCategory = '의약품';
     const govApiKey = process.env.NEXT_PUBLIC_BARCODE_API_KEY;
 
+    // 💡 핵심 패치: 한글 URL 깨짐 방지 및 공공 API 키 안전 인코딩
     if (govApiKey) {
       try {
-        // 대표님께서 찾으신 심평원 표준코드 API 규격에 맞춘 통신 주소 
-        const url = `https://api.odcloud.kr/api/15067462/v1/uddi:8cae86af-2ac7-4dde-a515-a7511994f74b?page=1&perPage=1&match[의약품표준코드]=${cleanBarcode}&serviceKey=${govApiKey}`;
-        const res = await fetch(url);
-        const data = await res.json();
+        const encodedParam = encodeURIComponent('match[의약품표준코드]');
+        const safeApiKey = govApiKey.includes('%') ? govApiKey : encodeURIComponent(govApiKey);
         
-        // 데이터가 정상 수신되었을 경우 '제품명' 추출
-        if (data?.data && data.data.length > 0) {
-          fetchedName = data.data[0]['제품명']; 
+        const url = `https://api.odcloud.kr/api/15067462/v1/uddi:8cae86af-2ac7-4dde-a515-a7511994f74b?page=1&perPage=1&${encodedParam}=${cleanBarcode}&serviceKey=${safeApiKey}`;
+        
+        const res = await fetch(url);
+        
+        if (res.ok) {
+          const data = await res.json();
+          if (data?.data && data.data.length > 0) {
+            fetchedName = data.data[0]['제품명']; 
+          }
+        } else {
+          console.error("국가 API 통신 거부 (상태코드):", res.status);
         }
       } catch (e) {
-        console.warn("국가 서버 통신 지연, 로컬 캐시로 전환합니다.", e);
+        console.warn("국가 API 서버 지연 에러:", e);
       }
     }
 
-    // 💡 2. 정부 서버 응답 실패 시 또는 미등록 코드일 경우, 로컬 캐시로 2차 검증
     if (!fetchedName && FALLBACK_CACHE[cleanBarcode]) {
       fetchedName = FALLBACK_CACHE[cleanBarcode].name;
       fetchedCategory = FALLBACK_CACHE[cleanBarcode].category;
     }
 
-    // 창고에서 기존 존재 여부 대조
     const { data: existingItems } = await supabase.from('items').select('*').ilike('name', fetchedName ? fetchedName : `%${cleanBarcode}%`);
 
     if (existingItems && existingItems.length > 0) {
-      alert(`[창고 내 매핑 완료]\n품목명: ${existingItems[0].name}\n해당 품목 관리 행으로 이동합니다.`);
+      alert(`[창고 내 매핑 완료]\n품목명: ${existingItems[0].name}`);
       setViewMode('active');
       setLeftSearch(existingItems[0].name);
     } else {
-      // 💡 [완전 자동 기입]
-      alert(`[신규 바코드 감지]\n시스템 등록창을 생성하고 정부 API 데이터를 주입합니다.`);
+      alert(`[신규 바코드 감지]\n시스템 등록창을 생성하고 데이터를 주입합니다.`);
       setNewName(fetchedName ? fetchedName : `미등록 바코드 (${cleanBarcode})`);
       setNewCategory(fetchedCategory);
       setNewExpireDateInput(parsedDate);
@@ -443,7 +444,7 @@ export default function InventoryDashboard() {
         </div>
       )}
 
-      {/* 📦 새 품목 등록 모달 (💡 정부 API 자동 기입형 상태 바인딩 완료) */}
+      {/* 📦 새 품목 등록 모달 */}
       {isAddModalOpen && (
         <div className="fixed inset-0 bg-black/85 flex items-center justify-center z-50 p-4 backdrop-blur-md">
           <form onSubmit={handleAddItem} className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-md w-full space-y-4 shadow-2xl">
