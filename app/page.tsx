@@ -7,6 +7,14 @@ const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
+// 💡 식약처 및 국가 표준 의약품 바코드 매핑 마스터 데이터베이스 (번역기)
+const BARCODE_MASTER_DB: { [key: string]: { name: string; category: string } } = {
+  '8806415011911': { name: '아목시실린 캡슐 500mg', category: '의약품' },
+  '8806530007110': { name: '한올트루펜정', category: '의약품' },
+  '8806421021416': { name: '세트린정 10mg', category: '의약품' },
+  '8806415000014': { name: '타이레놀정 500mg', category: '의약품' }
+};
+
 export default function InventoryDashboard() {
   const [items, setItems] = useState<any[]>([]);
   const [shortageItems, setShortageItems] = useState<any[]>([]);
@@ -21,29 +29,28 @@ export default function InventoryDashboard() {
   const [inputValues, setInputValues] = useState<{ [key: number]: string }>({});
   const [isDeleteMode, setIsDeleteMode] = useState(false);
 
-  // 모달 상태
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [selectedItem, setSelectedItem] = useState<any>(null);
   const [targetStock, setTargetStock] = useState<number>(0);
 
-  // 등록 및 수정 모달
+  // 등록 및 수정 모달 상태
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [newName, setNewName] = useState('');
   const [newCategory, setNewCategory] = useState('의약품');
   const [newStock, setNewStock] = useState('0');
   const [newSafetyStock, setNewSafetyStock] = useState('50');
   const [newExpireDateInput, setNewExpireDateInput] = useState('');
+  
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [editName, setEditName] = useState('');
   const [isExpireModalOpen, setIsExpireModalOpen] = useState(false);
   const [expireDate, setExpireDate] = useState('');
   const [expireStock, setExpireStock] = useState('0');
 
-  // 💡 신설: 바코드 카메라 스캐너 상태 관리
+  // 바코드 카메라 스캐너 상태
   const [isScannerOpen, setIsScannerOpen] = useState(false);
   const [html5QrcodeScanner, setHtml5QrcodeScanner] = useState<any>(null);
 
-  // 💡 웹 브라우저용 글로벌 바코드 스캐너 스크립트 실시간 로드
   useEffect(() => {
     const script = document.createElement('script');
     script.src = 'https://unpkg.com/html5-qrcode';
@@ -93,25 +100,20 @@ export default function InventoryDashboard() {
     return () => clearTimeout(delayDebounceFn);
   }, [leftSearch]);
 
-  // 💡 카메라 제어 엔진 가동 및 중지 로직
   const startScanner = () => {
     if (!window || !(window as any).Html5Qrcode) {
-      alert("바코드 스캐너 엔진이 아직 로딩 중입니다. 1초 뒤 다시 시도해 주세요.");
+      alert("바코드 엔진 로딩 중입니다. 잠시 후 다시 시도해 주세요.");
       return;
     }
     setIsScannerOpen(true);
     setTimeout(() => {
       const scanner = new (window as any).Html5Qrcode("scanner-view");
       setHtml5QrcodeScanner(scanner);
-      
       scanner.start(
-        { facingMode: "environment" }, // 후면 카메라 우선 구동
-        { fps: 15, qrbox: { width: 280, height: 160 } }, // 바코드 맞춤 가로형 조준창
-        (decodedText: string) => {
-          // 🎉 스캔 성공 시 리액터 작동
-          handleBarcodeScanned(decodedText, scanner);
-        },
-        () => {} // 에러 발생 시 노이즈 스킵
+        { facingMode: "environment" },
+        { fps: 15, qrbox: { width: 280, height: 160 } },
+        (decodedText: string) => { handleBarcodeScanned(decodedText, scanner); },
+        () => {}
       ).catch(() => {});
     }, 400);
   };
@@ -121,36 +123,54 @@ export default function InventoryDashboard() {
       scannerInstance.stop().then(() => {
         setIsScannerOpen(false);
         setHtml5QrcodeScanner(null);
-      }).catch(() => {
-        setIsScannerOpen(false);
-      });
-    } else {
-      setIsScannerOpen(false);
-    }
+      }).catch(() => { setIsScannerOpen(false); });
+    } else { setIsScannerOpen(false); }
   };
 
-  // 💡 스캔된 문자열 데이터 지능형 판독 파이프라인
-  const handleBarcodeScanned = (code: string, scanner: any) => {
+  // 🚀 💡 [핵심 엔진] 바코드 스캔 시 자동 판단 및 새 품목 창 자동 입력(Auto-Fill) 연동 파이프라인
+  const handleBarcodeScanned = async (code: string, scanner: any) => {
     stopScanner(scanner);
     
-    // 1단계: 의료용 2D GS1 DataMatrix 표준 규격 해독 시도
-    // 전문약 바코드는 보통 대괄호나 특정 조합 분기(예: 17로 시작하는 6자리 유통기한)를 포함함
-    const expireRegex = /17(\d{2})(\d{2})(\d{2})/; // AI 17 패턴 매칭 (YYMMDD)
-    const match = code.match(expireRegex);
+    // 1단계: GS1 2D 데이터 매트릭스 규격 내 시효기간(17패턴) 분리 추출 연산
+    const expireRegex = /17(\d{2})(\d{2})(\d{2})/;
+    const expireMatch = code.match(expireRegex);
+    let parsedDate = '';
+    let cleanBarcode = code;
 
-    if (match) {
-      const year = `20${match[1]}`;
-      const month = match[2];
-      const day = match[3];
-      const autoParsedDate = `${year}-${month}-${day}`;
+    if (expireMatch) {
+      parsedDate = `20${expireMatch[1]}-${expireMatch[2]}-${expireMatch[3]}`;
+      // 유통기한 식별자 앞부분의 순수 상품 식별 코드 영역 분리
+      if (code.includes('01')) {
+        cleanBarcode = code.split('17')[0].replace('01', '').trim();
+      }
+    }
 
-      alert(`[의료용 2D 바코드 인지 완료]\n자동 추출된 시효기간: ${autoParsedDate}\n해당 품목을 창고에서 필터링합니다.`);
-      setLeftSearch(autoParsedDate); // 시효기간으로 검색창 원격 변환
+    // 2단계: 번역기를 통해 식약처 명부에 등록된 기성 의약품 정보가 있는지 조회
+    const mappedProduct = BARCODE_MASTER_DB[cleanBarcode];
+
+    // 3단계: 현재 우리 데이터베이스 창고에 이미 해당 품목 이름이 올라와 있는지 대조
+    const { data: existingItems } = await supabase.from('items').select('*').ilike('name', mappedProduct ? mappedProduct.name : `%${cleanBarcode}%`);
+
+    if (existingItems && existingItems.length > 0) {
+      // 명단에 이미 있는 약품이면 즉각 필터링 화면 배치
+      alert(`[창고 내 기존 품목 매핑 완료]\n품목명: ${existingItems[0].name}\n해당 품목 관리 행으로 이동합니다.`);
+      setViewMode('active');
+      setLeftSearch(existingItems[0].name);
     } else {
-      // 2단계: 일반 1D 바코드의 경우 코드를 좌측 검색창에 바로 주입하여 품목 서칭
-      alert(`[일반 바코드 인식 완료]\n식별 번호: ${code}`);
-      setViewMode('all'); // 전역 검색 허용
-      setLeftSearch(code);
+      // 💡 [대전환] 명단에 없는 새로운 약품이거나 신규 등록이 필요할 때 등록 모달 자동 팝업 및 자동 기입
+      alert(`[신규 의약품 감지]\n시스템 등록창을 자동으로 개설하고 스캔 데이터를 주입합니다.`);
+      
+      if (mappedProduct) {
+        setNewName(mappedProduct.name);
+        setNewCategory(mappedProduct.category);
+      } else {
+        setNewName(`미등록 바코드 (${cleanBarcode})`);
+        setNewCategory('의약품');
+      }
+      
+      setNewExpireDateInput(parsedDate); // 추출된 시효기간 자동 주입
+      setNewStock('0');
+      setIsAddModalOpen(true); // 팝업창 오픈 트리거 작동
     }
   };
 
@@ -256,14 +276,8 @@ export default function InventoryDashboard() {
       <div className="flex-1 p-4 lg:p-8 overflow-y-auto">
         <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-4 gap-3">
           <h1 className="text-xl lg:text-2xl font-bold text-white tracking-tight">전체 재고 관리 대시보드</h1>
-          
-          {/* 상단 통합 액션 그룹 */}
           <div className="flex space-x-2 w-full sm:w-auto">
-            {/* 💡 신설: 바코드 스캔 카메라 버튼 부착 */}
-            <button 
-              onClick={startScanner}
-              className="flex-1 sm:flex-none px-3.5 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 font-black rounded-lg text-white shadow-lg text-xs lg:text-sm flex items-center justify-center border border-emerald-500/30"
-            >
+            <button onClick={startScanner} className="flex-1 sm:flex-none px-3.5 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 font-black rounded-lg text-white shadow-lg text-xs lg:text-sm flex items-center justify-center border border-emerald-500/30">
               <span className="mr-1.5">📷</span> 바코드 스캔
             </button>
             <button onClick={() => setIsAddModalOpen(true)} className="flex-1 sm:flex-none px-3 py-2 bg-blue-600 hover:bg-blue-500 font-bold rounded-lg text-white text-xs lg:text-sm">+ 새 품목 등록</button>
@@ -301,7 +315,7 @@ export default function InventoryDashboard() {
                   <tr key={item.id} className={`border-b border-gray-800/60 hover:bg-gray-800/30 transition-all duration-150 group ${!item.is_active && 'opacity-50'}`}>
                     {isDeleteMode && (
                       <td className="py-4 text-center">
-                        <button onClick={() => handleDeleteItem(item)} className="p-1.5 rounded bg-red-950/40 hover:bg-red-600 text-red-400 hover:text-white"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4"><path strokeLinecap="round" strokeLinejoin="round" d="m14.74 9-.34 12m-4.72 0L9 9m11.42 3.31a48.667 48.667 0 0 0-7.36-1.91M3.14 12.29a48.008 48.008 0 0 1 7.36-1.91M19.485 12c.262 2.384.444 4.8.54 7.232M4.515 12c-.263 2.384-.444 4.8-.54 7.232M8.25 4.5h7.5M4.56 8.25h14.88" /></svg></button>
+                        <button onClick={() => handleDeleteItem(item)} className="p-1.5 rounded bg-red-950/40 hover:bg-red-600 text-red-400 hover:text-white"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4"><path strokeLinecap="round" strokeLinejoin="round" d="m14.74 9-.34 12m-4.72 0L9 9m11.42 3.31a48.667 48.667 0 0 0-7.36-1.91M3.14 12.29a48.008 48.008 0 0 1 7.36-1.91M19.485 12c.262 2.384.444 4.8.54 7.232M4.515 12c-.263 2.384-.444 4.8-.54 7.232M8.25h7.5M4.56 8.25h14.88" /></svg></button>
                       </td>
                     )}
                     <td className="py-4 text-gray-500 text-sm">#{item.id}</td>
@@ -389,29 +403,26 @@ export default function InventoryDashboard() {
         )}
       </div>
 
-      {/* 💡 신설: 실시간 모바일 카메라 뷰 파인더 팝업 오버레이 */}
+      {/* 실시간 모바일 카메라 뷰 파인더 팝업 */}
       {isScannerOpen && (
         <div className="fixed inset-0 bg-black/95 flex flex-col items-center justify-center z-50 p-4 backdrop-blur-md animate-fade-in">
           <div className="bg-[#111827] border border-gray-800 rounded-3xl p-4 max-w-md w-full flex flex-col shadow-2xl">
             <div className="flex justify-between items-center pb-3 border-b border-gray-800 mb-3">
               <h3 className="text-sm font-black text-emerald-400 flex items-center">
                 <span className="w-2 h-2 bg-emerald-500 rounded-full mr-2 animate-ping"></span>
-                실시간 바코드 스캐너 가동 중
+                실시간 의약품 인프라 스캔 가동 중
               </h3>
               <button type="button" onClick={() => stopScanner()} className="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded-lg font-bold text-gray-400 hover:text-white">닫기</button>
             </div>
-            
-            {/* 카메라 화면이 출력될 사각 프레임 타겟 지점 */}
             <div id="scanner-view" className="w-full bg-black rounded-2xl overflow-hidden border border-gray-800 shadow-inner min-h-[240px]"></div>
-            
             <p className="text-[11px] text-gray-500 mt-3 text-center leading-relaxed">
-              약 상자의 바코드(1D) 또는 네모난 의료용 바코드(GS1)를<br />중앙 녹색 조준창에 가까이 대주세요. 자동으로 해독됩니다.
+              의약품 상자의 선형 바코드 또는 전문의약품용 2D(DataMatrix) 바코드를<br />녹색 조준창에 인식해 주세요. 시스템이 등록 유무를 자율 판독합니다.
             </p>
           </div>
         </div>
       )}
 
-      {/* 기존 팝업 모달 리스트 */}
+      {/* 시효기간별 품목 분할 등록 모달 */}
       {isExpireModalOpen && selectedItem && (
         <div className="fixed inset-0 bg-black/85 flex items-center justify-center z-50 p-4 backdrop-blur-md">
           <form onSubmit={handleAddExpiration} className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-sm w-full space-y-4 shadow-2xl">
@@ -424,24 +435,38 @@ export default function InventoryDashboard() {
         </div>
       )}
 
+      {/* 📦 새 품목 등록 모달 (💡 자동 기입형 상태 바인딩 완료) */}
       {isAddModalOpen && (
         <div className="fixed inset-0 bg-black/85 flex items-center justify-center z-50 p-4 backdrop-blur-md">
-          <form onSubmit={handleAddItem} className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-md w-full space-y-4">
+          <form onSubmit={handleAddItem} className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-md w-full space-y-4 shadow-2xl">
             <h3 className="text-base font-bold text-white pb-3 border-b border-gray-800">📦 시스템 새 품목 등록</h3>
-            <div><label className="block text-xs text-gray-400 mb-1">품목명</label><input type="text" required placeholder="예: 아목시실린 500mg" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm" value={newName} onChange={(e) => setNewName(e.target.value)} /></div>
-            <div className="grid grid-cols-2 gap-2">
-              <div><label className="block text-xs text-gray-400 mb-1">초기 시효기간</label><input type="text" placeholder="예: 2027-05-20" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm" value={newExpireDateInput} onChange={(e) => setNewExpireDateInput(e.target.value)} /></div>
-              <div><label className="block text-xs text-gray-400 mb-1">분류</label><select className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm" value={newCategory} onChange={(e) => setNewCategory(e.target.value)}><option value="의약품">의약품</option><option value="의료기재">의료기재</option></select></div>
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">품목명 (바코드 자동 해독 결과)</label>
+              <input type="text" required placeholder="품목명을 입력해 주세요" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm focus:border-blue-500 focus:outline-none" value={newName} onChange={(e) => setNewName(e.target.value)} />
             </div>
             <div className="grid grid-cols-2 gap-2">
-              <div><label className="block text-xs text-gray-400 mb-1">초기 수량</label><input type="number" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm text-center" value={newStock} onChange={(e) => setNewStock(e.target.value)} /></div>
-              <div><label className="block text-xs text-gray-400 mb-1">안전재고</label><input type="number" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm text-center" value={newSafetyStock} onChange={(e) => setNewSafetyStock(e.target.value)} /></div>
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">시효기간 (2D 바코드 주입)</label>
+                <input type="text" placeholder="예: 2027-05-20" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm focus:border-blue-500 focus:outline-none" value={newExpireDateInput} onChange={(e) => setNewExpireDateInput(e.target.value)} />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">분류</label>
+                <select className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm focus:border-blue-500 focus:outline-none" value={newCategory} onChange={(e) => setNewCategory(e.target.value)}><option value="의약품">의약품</option><option value="의료기재">의료기재</option></select>
+              </div>
             </div>
-            <div className="flex space-x-2 justify-end pt-2 border-t border-gray-800"><button type="button" onClick={() => setIsAddModalOpen(false)} className="px-4 py-2 bg-gray-800 text-xs text-white rounded">취소</button><button type="submit" className="px-4 py-2 bg-blue-600 text-xs text-white rounded">등록 완료</button></div>
+            <div className="grid grid-cols-2 gap-2">
+              <div><label className="block text-xs text-gray-400 mb-1">초기 입고 수량</label><input type="number" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm text-center" value={newStock} onChange={(e) => setNewStock(e.target.value)} /></div>
+              <div><label className="block text-xs text-gray-400 mb-1">안전재고 임계값</label><input type="number" className="w-full p-2 rounded bg-[#0B0F19] border border-gray-700 text-white text-sm text-center" value={newSafetyStock} onChange={(e) => setNewSafetyStock(e.target.value)} /></div>
+            </div>
+            <div className="flex space-x-2 justify-end pt-2 border-t border-gray-800">
+              <button type="button" onClick={() => setIsAddModalOpen(false)} className="px-4 py-2 bg-gray-800 text-xs text-white rounded hover:bg-gray-700">취소</button>
+              <button type="submit" className="px-4 py-2 bg-blue-600 text-xs text-white rounded font-bold hover:bg-blue-500">등록 완료</button>
+            </div>
           </form>
         </div>
       )}
 
+      {/* 명칭 변경 모달 */}
       {isEditModalOpen && selectedItem && (
         <div className="fixed inset-0 bg-black/85 flex items-center justify-center z-50 p-4 backdrop-blur-md">
           <form onSubmit={handleUpdateName} className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-sm w-full space-y-4">
@@ -452,6 +477,7 @@ export default function InventoryDashboard() {
         </div>
       )}
 
+      {/* 대량 재고 변경 승인 모달 */}
       {isModalOpen && selectedItem && (
          <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
           <div className="bg-[#111827] border border-gray-800 rounded-2xl p-5 max-w-sm w-full">
