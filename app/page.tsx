@@ -8,7 +8,7 @@ const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 const FALLBACK_CACHE: { [key: string]: { name: string; category: string } } = {
-  '8806415011911': { name: '아목시실린 캡슐 500mg', category: '의약품' },
+  '8806415011911': { name: '아목시실린 캡슐 500mg', category: 'of약품' },
   '8806530007110': { name: '한올트루펜정', category: '의약품' },
   '8806421021416': { name: '세트린정 10mg', category: '의약품' },
   '8806415000014': { name: '타이레놀정 500mg', category: '의약품' }
@@ -85,7 +85,8 @@ export default function InventoryDashboard() {
         fetchMainItems(leftSearch, viewMode);
         fetchShortageItems(); 
       })
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'inventory_logs' }, () => {
+      // 💡 INSERT뿐만 아니라 합산 수정(UPDATE) 이벤트도 실시간 감지하도록 변경
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'inventory_logs' }, () => {
         fetchLogs();
       })
       .subscribe();
@@ -180,11 +181,41 @@ export default function InventoryDashboard() {
   const toggleActiveStatus = async (item: any) => {
     const newStatus = !item.is_active;
     setItems(prev => prev.map(i => i.id === item.id ? { ...i, is_active: newStatus } : i));
-    const { error } = await supabase.from('items').update({ is_active: newStatus }).eq('id', item.id);
-    if (error) { setItems(prev => prev.map(i => i.id === item.id ? { ...i, is_active: !newStatus } : i)); alert("상태 변경 실패: " + error.message); }
+    const { error = null } = await supabase.from('items').update({ is_active: newStatus }).eq('id', item.id) || {};
+    if (error) { setItems(prev => prev.map(i => i.id === item.id ? { ...i, is_active: !newStatus } : i)); alert("상태 변경 실패"); }
   };
 
   const handleInputChange = (itemId: number, value: string) => { setInputValues(prev => ({ ...prev, [itemId]: value })); };
+
+  // 💡 신설: 연속적인 다발성 클릭 및 입고 건에 대한 지능형 합산 연산 트랜잭션 함수
+  const saveLog = async (itemName: string, expireDate: string, qty: number) => {
+    const timeLimit = new Date(Date.now() - 30 * 1000).toISOString(); // 최근 30초 상간 조회 임계점
+    
+    const { data: recentLogs } = await supabase
+      .from('inventory_logs')
+      .select('*')
+      .eq('item_name', itemName)
+      .eq('expiration_date', expireDate || '')
+      .gt('created_at', timeLimit)
+      .order('id', { ascending: false })
+      .limit(1);
+
+    if (recentLogs && recentLogs.length > 0) {
+      // 30초 내 동일 약품/시효 소모 발견 시 기존 줄에 수량 누적 합산 업데이트 조치
+      const latestLog = recentLogs[0];
+      const newQty = latestLog.quantity + qty;
+      await supabase
+        .from('inventory_logs')
+        .update({ quantity: newQty, created_at: new Date().toISOString() }) // 타임스탬프 최신화
+        .eq('id', latestLog.id);
+    } else {
+      // 완전 신규 소모 건일 경우 정식 행 개설
+      await supabase
+        .from('inventory_logs')
+        .insert([{ item_name: itemName, expiration_date: expireDate || '', quantity: qty }]);
+    }
+    fetchLogs();
+  };
 
   const handleRelativeClick = async (item: any, change: number) => {
     const newStock = item.current_stock + change;
@@ -195,17 +226,14 @@ export default function InventoryDashboard() {
     
     if (change < 0) {
       const consumedQty = Math.abs(change);
-      const { error: logError } = await supabase.from('inventory_logs').insert([{ item_name: item.name, quantity: consumedQty }]);
-      if (!logError) fetchLogs(); 
+      await saveLog(item.name, item.expiration_date, consumedQty); // 지능형 통합 엔진으로 라우팅
     }
     fetchShortageItems();
   };
 
-  // 💡 [핵심] 스마트 기호 인식 엔진 (+, - 대량 계산)
   const handleAbsoluteClick = (item: any) => {
     const value = inputValues[item.id];
     if (!value || value.trim() === '') { alert("변경할 수량을 입력해주세요."); return; }
-
     const strValue = value.trim();
     let parsedTarget = 0;
 
@@ -219,40 +247,31 @@ export default function InventoryDashboard() {
     }
 
     if (parsedTarget < 0) { alert("결과 재고가 0개 미만으로 내려갈 수 없습니다."); return; }
-
-    setSelectedItem(item);
-    setTargetStock(parsedTarget);
-    setIsModalOpen(true);
+    setSelectedItem(item); setTargetStock(parsedTarget); setIsModalOpen(true);
   };
 
-  // 💡 [핵심] 변동량 차이(diff)를 계산하여 모든 소모 내역을 로그 보드에 자동 기록
   const handleConfirmChange = async () => {
     if (!selectedItem) return;
-    
     const diff = targetStock - selectedItem.current_stock;
     
     setItems(prev => prev.map(i => i.id === selectedItem.id ? { ...i, current_stock: targetStock } : i));
     const { error: itemError } = await supabase.from('items').update({ current_stock: targetStock }).eq('id', selectedItem.id);
-    if (itemError) { alert("재고 수정 실패: " + itemError.message); return; }
+    if (itemError) { alert("재고 수정 실패"); return; }
 
-    // 마이너스 변동(출고)이 발생했을 때만 로그 테이블에 기록
     if (diff < 0) {
       const consumedQty = Math.abs(diff);
-      const { error: logError } = await supabase.from('inventory_logs').insert([{ item_name: selectedItem.name, quantity: consumedQty }]);
-      if (!logError) fetchLogs();
+      await saveLog(selectedItem.name, selectedItem.expiration_date, consumedQty); // 대량 기입 소모도 시효기간과 함께 통합 처리
     }
 
     setInputValues(prev => ({ ...prev, [selectedItem.id]: '' }));
-    setIsModalOpen(false);
-    setSelectedItem(null);
-    fetchShortageItems();
+    setIsModalOpen(false); setSelectedItem(null); fetchShortageItems();
   };
 
   const handleAddItem = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newName.trim()) return;
     const { error } = await supabase.from('items').insert([{ name: newName, category: newCategory, current_stock: parseInt(newStock, 10) || 0, safety_stock: parseInt(newSafetyStock, 10) || 50, expiration_date: newExpireDateInput.trim(), is_active: true }]);
-    if (error) alert("등록 실패: " + error.message);
+    if (error) alert("등록 실패");
     else { setIsAddModalOpen(false); setNewName(''); setNewStock('0'); setNewExpireDateInput(''); }
   };
 
@@ -260,7 +279,7 @@ export default function InventoryDashboard() {
     e.preventDefault();
     if (!selectedItem || !editName.trim()) return;
     const { error } = await supabase.from('items').update({ name: editName.trim() }).eq('id', selectedItem.id);
-    if (error) alert("명칭 수정 실패: " + error.message);
+    if (error) alert("명칭 수정 실패");
     else { setIsEditModalOpen(false); setSelectedItem(null); setEditName(''); }
   };
 
@@ -268,19 +287,23 @@ export default function InventoryDashboard() {
     e.preventDefault();
     if (!selectedItem || !expireDate.trim()) return;
     const { error } = await supabase.from('items').insert([{ name: selectedItem.name, category: selectedItem.category || '의약품', current_stock: parseInt(expireStock, 10) || 0, safety_stock: selectedItem.safety_stock || 50, expiration_date: expireDate.trim(), is_active: true }]);
-    if (error) alert("시효 분할 추가 실패: " + error.message);
+    if (error) alert("시효 분할 추가 실패");
     else { setIsExpireModalOpen(false); setSelectedItem(null); setExpireDate(''); setExpireStock('0'); }
   };
 
   const handleDeleteItem = async (item: any) => {
     if (!confirm(`[경고] "${item.name}" 품목을 영구 철거합니까?`)) return;
     setItems(prev => prev.filter(i => i.id !== item.id));
-    const { error } = await supabase.from('items').delete().eq('id', item.id);
-    if (error) alert("삭제 실패: " + error.message);
+    await supabase.from('items').delete().eq('id', item.id);
   };
 
   const filteredShortageItems = shortageItems.filter(item => item.name.toLowerCase().includes(rightSearch.toLowerCase()));
-  const filteredLogs = logs.filter(log => log.item_name.toLowerCase().includes(logSearch.toLowerCase()));
+  
+  // 💡 개선: 이름뿐만 아니라 로그의 시효기간을 검색해도 실시간 필터링되도록 제어 엔진 확장
+  const filteredLogs = logs.filter(log => 
+    log.item_name.toLowerCase().includes(logSearch.toLowerCase()) ||
+    (log.expiration_date && log.expiration_date.toLowerCase().includes(logSearch.toLowerCase()))
+  );
 
   const getExpireStatus = (dateStr: string) => {
     if (!dateStr || dateStr.trim() === '') return { text: '미기입', classes: 'text-gray-400 bg-gray-900/60 border-gray-800' };
@@ -374,7 +397,6 @@ export default function InventoryDashboard() {
                         </div>
                         <span className="text-gray-700 font-light">/</span>
                         <div className="flex items-center space-x-1.5">
-                          {/* 💡 입력 필드: 이제 텍스트 타입으로 변경되어 + 또는 - 타이핑이 완전히 자유롭습니다. */}
                           <input type="text" placeholder="+/-수량" disabled={!item.is_active} className="w-16 p-1.5 text-center rounded bg-[#0B0F19] border border-gray-700 text-white text-xs focus:outline-none focus:border-blue-500" value={inputValues[item.id] || ''} onChange={(e) => handleInputChange(item.id, e.target.value)} />
                           <button onClick={() => handleAbsoluteClick(item)} disabled={!item.is_active} className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 text-xs font-bold rounded text-white transition-colors disabled:opacity-30">적용</button>
                         </div>
@@ -417,19 +439,25 @@ export default function InventoryDashboard() {
           </div>
         )}
 
+        {/* 💡 소모 로그 출력부 고도화 완료 (시효기간 완전 명시) */}
         {rightTab === 'logs' && (
           <div className="flex flex-col flex-1 overflow-hidden">
-            <div className="mb-3"><input type="text" placeholder="로그 기록 내품목 검색..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs" value={logSearch} onChange={(e) => setLogSearch(e.target.value)} /></div>
+            <div className="mb-3"><input type="text" placeholder="품목명 또는 시효기간 날짜 검색..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs focus:outline-none focus:border-blue-500" value={logSearch} onChange={(e) => setLogSearch(e.target.value)} /></div>
             <div className="flex-1 overflow-y-auto space-y-2 pr-1 scrollbar-thin">
               {filteredLogs.map(log => (
                 <div key={log.id} className="bg-blue-950/10 border border-blue-950/60 p-3 rounded-xl shadow-sm flex flex-col border-l-4 border-l-blue-500">
                   <span className="text-[11px] text-gray-400 font-medium mb-1">{formatKoreanDate(log.created_at)}</span>
                   <div className="flex justify-between items-start">
-                    <span className="text-white text-xs font-semibold max-w-[180px] truncate">{log.item_name}</span>
-                    <span className="text-red-400 font-bold text-xs bg-red-950/30 px-2 py-0.5 rounded border border-red-900/20">-{log.quantity}개 소모</span>
+                    <div className="flex flex-col">
+                      <span className="text-white text-xs font-semibold max-w-[180px] truncate">{log.item_name}</span>
+                      {/* 💡 시효기간 추적 뱃지 출력 라인 추가 */}
+                      <span className="text-[10px] text-yellow-500 font-medium mt-0.5">시효기한: {log.expiration_date || '미기입'}</span>
+                    </div>
+                    <span className="text-red-400 font-bold text-xs bg-red-950/30 px-2 py-0.5 rounded border border-red-900/20 shrink-0">-{log.quantity}개 소모</span>
                   </div>
                 </div>
               ))}
+              {filteredLogs.length === 0 && <div className="text-center text-gray-500 mt-10 text-xs">소모 처리 이력이 존재하지 않습니다.</div>}
             </div>
           </div>
         )}
@@ -488,7 +516,6 @@ export default function InventoryDashboard() {
         </div>
       )}
 
-      {/* 💡 [대형 팝업 업데이트] 대량 재고 변경 시뮬레이션 및 확인 모달 */}
       {isModalOpen && selectedItem && (() => {
         const diff = targetStock - selectedItem.current_stock;
         const diffColor = diff > 0 ? 'text-green-400' : diff < 0 ? 'text-red-400' : 'text-gray-400';
@@ -507,9 +534,7 @@ export default function InventoryDashboard() {
                 </div>
                 <div className="text-center flex flex-col items-center justify-center px-4">
                   <p className="text-[10px] text-gray-500 mb-1">변동량</p>
-                  <p className={`text-base font-black bg-gray-900 px-3 py-0.5 rounded-full border border-gray-800 ${diffColor}`}>
-                    {diffText}
-                  </p>
+                  <p className={`text-base font-black bg-gray-900 px-3 py-0.5 rounded-full border border-gray-800 ${diffColor}`}>{diffText}</p>
                 </div>
                 <div className="text-center">
                   <p className="text-[10px] text-gray-500 mb-1">최종 수량</p>
