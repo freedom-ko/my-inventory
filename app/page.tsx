@@ -8,7 +8,7 @@ const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 const FALLBACK_CACHE: { [key: string]: { name: string; category: string } } = {
-  '8806415011911': { name: '아목시실린 캡슐 500mg', category: 'of약품' },
+  '8806415011911': { name: '아목시실린 캡슐 500mg', category: '의약품' },
   '8806530007110': { name: '한올트루펜정', category: '의약품' },
   '8806421021416': { name: '세트린정 10mg', category: '의약품' },
   '8806415000014': { name: '타이레놀정 500mg', category: '의약품' }
@@ -24,6 +24,10 @@ export default function InventoryDashboard() {
   const [rightSearch, setRightSearch] = useState('');
   const [logSearch, setLogSearch] = useState('');
   
+  // 💡 신설: 우측 패널 카테고리 필터링 상태 제어
+  const [shortageFilter, setShortageFilter] = useState<'전체' | '의약품' | '의료기재'>('전체');
+  const [logFilter, setLogFilter] = useState<'전체' | '의약품' | '의료기재'>('전체');
+
   const [viewMode, setViewMode] = useState<'active' | 'all'>('active');
   const [inputValues, setInputValues] = useState<{ [key: number]: string }>({});
   const [isDeleteMode, setIsDeleteMode] = useState(false);
@@ -85,7 +89,6 @@ export default function InventoryDashboard() {
         fetchMainItems(leftSearch, viewMode);
         fetchShortageItems(); 
       })
-      // 💡 INSERT뿐만 아니라 합산 수정(UPDATE) 이벤트도 실시간 감지하도록 변경
       .on('postgres_changes', { event: '*', schema: 'public', table: 'inventory_logs' }, () => {
         fetchLogs();
       })
@@ -187,9 +190,9 @@ export default function InventoryDashboard() {
 
   const handleInputChange = (itemId: number, value: string) => { setInputValues(prev => ({ ...prev, [itemId]: value })); };
 
-  // 💡 신설: 연속적인 다발성 클릭 및 입고 건에 대한 지능형 합산 연산 트랜잭션 함수
-  const saveLog = async (itemName: string, expireDate: string, qty: number) => {
-    const timeLimit = new Date(Date.now() - 30 * 1000).toISOString(); // 최근 30초 상간 조회 임계점
+  // 💡 수정: 카테고리 파라미터를 추가로 전송받아 로그 테이블에 동시 주입
+  const saveLog = async (itemName: string, category: string, expireDate: string, qty: number) => {
+    const timeLimit = new Date(Date.now() - 30 * 1000).toISOString(); 
     
     const { data: recentLogs } = await supabase
       .from('inventory_logs')
@@ -201,18 +204,16 @@ export default function InventoryDashboard() {
       .limit(1);
 
     if (recentLogs && recentLogs.length > 0) {
-      // 30초 내 동일 약품/시효 소모 발견 시 기존 줄에 수량 누적 합산 업데이트 조치
       const latestLog = recentLogs[0];
       const newQty = latestLog.quantity + qty;
       await supabase
         .from('inventory_logs')
-        .update({ quantity: newQty, created_at: new Date().toISOString() }) // 타임스탬프 최신화
+        .update({ quantity: newQty, created_at: new Date().toISOString() }) 
         .eq('id', latestLog.id);
     } else {
-      // 완전 신규 소모 건일 경우 정식 행 개설
       await supabase
         .from('inventory_logs')
-        .insert([{ item_name: itemName, expiration_date: expireDate || '', quantity: qty }]);
+        .insert([{ item_name: itemName, category: category || '의약품', expiration_date: expireDate || '', quantity: qty }]);
     }
     fetchLogs();
   };
@@ -226,7 +227,7 @@ export default function InventoryDashboard() {
     
     if (change < 0) {
       const consumedQty = Math.abs(change);
-      await saveLog(item.name, item.expiration_date, consumedQty); // 지능형 통합 엔진으로 라우팅
+      await saveLog(item.name, item.category, item.expiration_date, consumedQty); // 카테고리 전송
     }
     fetchShortageItems();
   };
@@ -260,7 +261,7 @@ export default function InventoryDashboard() {
 
     if (diff < 0) {
       const consumedQty = Math.abs(diff);
-      await saveLog(selectedItem.name, selectedItem.expiration_date, consumedQty); // 대량 기입 소모도 시효기간과 함께 통합 처리
+      await saveLog(selectedItem.name, selectedItem.category, selectedItem.expiration_date, consumedQty); // 카테고리 전송
     }
 
     setInputValues(prev => ({ ...prev, [selectedItem.id]: '' }));
@@ -297,13 +298,18 @@ export default function InventoryDashboard() {
     await supabase.from('items').delete().eq('id', item.id);
   };
 
-  const filteredShortageItems = shortageItems.filter(item => item.name.toLowerCase().includes(rightSearch.toLowerCase()));
+  // 💡 개선: 이름 검색과 더불어 '의약품 / 의료기재' 탭 상태에 따른 이중 필터링 적용
+  const filteredShortageItems = shortageItems.filter(item => {
+    const matchSearch = item.name.toLowerCase().includes(rightSearch.toLowerCase());
+    const matchCategory = shortageFilter === '전체' ? true : (item.category || '의약품') === shortageFilter;
+    return matchSearch && matchCategory;
+  });
   
-  // 💡 개선: 이름뿐만 아니라 로그의 시효기간을 검색해도 실시간 필터링되도록 제어 엔진 확장
-  const filteredLogs = logs.filter(log => 
-    log.item_name.toLowerCase().includes(logSearch.toLowerCase()) ||
-    (log.expiration_date && log.expiration_date.toLowerCase().includes(logSearch.toLowerCase()))
-  );
+  const filteredLogs = logs.filter(log => {
+    const matchSearch = log.item_name.toLowerCase().includes(logSearch.toLowerCase()) || (log.expiration_date && log.expiration_date.toLowerCase().includes(logSearch.toLowerCase()));
+    const matchCategory = logFilter === '전체' ? true : (log.category || '의약품') === logFilter;
+    return matchSearch && matchCategory;
+  });
 
   const getExpireStatus = (dateStr: string) => {
     if (!dateStr || dateStr.trim() === '') return { text: '미기입', classes: 'text-gray-400 bg-gray-900/60 border-gray-800' };
@@ -375,6 +381,8 @@ export default function InventoryDashboard() {
                     <td className="py-4 text-gray-500 text-sm">#{item.id}</td>
                     <td className="py-4 font-medium text-white">
                       <div className="flex items-center">
+                        {/* 💡 테이블의 품목명 옆에도 작게 카테고리 뱃지를 표시하면 직관적입니다. */}
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 border border-gray-700 mr-2 shrink-0">{item.category || '의약품'}</span>
                         <span className="truncate max-w-xs">{item.name}</span>
                         <button onClick={() => { setSelectedItem(item); setEditName(item.name); setIsEditModalOpen(true); }} className="ml-2 opacity-100 lg:opacity-0 lg:group-hover:opacity-100 text-gray-400 hover:text-blue-400 p-1 rounded hover:bg-gray-800 bg-gray-800/50 lg:bg-transparent"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.8} stroke="currentColor" className="w-3.5 h-3.5"><path strokeLinecap="round" strokeLinejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L6.832 19.82a4.5 4.5 0 0 1-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 0 1 1.13-1.897L16.863 4.487Zm0 0L19.5 7.125" /></svg></button>
                       </div>
@@ -413,20 +421,29 @@ export default function InventoryDashboard() {
 
       {/* 🔴 우측 탭 제어 피드 */}
       <div className="w-full lg:w-96 h-[45vh] lg:h-auto bg-[#111827] border-t lg:border-t-0 lg:border-l border-gray-800/80 p-4 lg:p-6 flex flex-col shadow-2xl shrink-0 z-10">
-        <div className="flex space-x-1 bg-[#0B0F19] p-1 rounded-lg border border-gray-800 mb-4">
+        <div className="flex space-x-1 bg-[#0B0F19] p-1 rounded-lg border border-gray-800 mb-3">
           <button onClick={() => setRightTab('shortage')} className={`flex-1 py-2 text-center rounded-md text-xs font-black transition-all ${rightTab === 'shortage' ? 'bg-red-950/60 text-red-400 shadow' : 'text-gray-500'}`}>🚨 긴급 보충</button>
-          <button onClick={() => setRightTab('logs')} className={`flex-1 py-2 text-center rounded-md text-xs font-black transition-all ${rightTab === 'logs' ? 'bg-blue-950/60 text-blue-400 shadow' : 'text-gray-500'}`}>📋 소모 로그 보드</button>
+          <button onClick={() => setRightTab('logs')} className={`flex-1 py-2 text-center rounded-md text-xs font-black transition-all ${rightTab === 'logs' ? 'bg-blue-950/60 text-blue-400 shadow' : 'text-gray-500'}`}>📋 소모 로그</button>
         </div>
 
         {rightTab === 'shortage' && (
           <div className="flex flex-col flex-1 overflow-hidden">
-            <div className="mb-3"><input type="text" placeholder="부족 품목 중 검색..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs" value={rightSearch} onChange={(e) => setRightSearch(e.target.value)} /></div>
+            {/* 💡 신설: 긴급 보충 카테고리 서브 필터 버튼 */}
+            <div className="flex space-x-1.5 mb-3 bg-[#0B0F19]/50 p-1 rounded border border-gray-800">
+              <button onClick={() => setShortageFilter('전체')} className={`flex-1 py-1 text-[11px] rounded transition-all ${shortageFilter === '전체' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>전체</button>
+              <button onClick={() => setShortageFilter('의약품')} className={`flex-1 py-1 text-[11px] rounded transition-all ${shortageFilter === '의약품' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>💊 의약품</button>
+              <button onClick={() => setShortageFilter('의료기재')} className={`flex-1 py-1 text-[11px] rounded transition-all ${shortageFilter === '의료기재' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>🩹 의료기재</button>
+            </div>
+            <div className="mb-3"><input type="text" placeholder="부족 품목 검색..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs" value={rightSearch} onChange={(e) => setRightSearch(e.target.value)} /></div>
             <div className="flex-1 overflow-y-auto space-y-2.5 pr-1 scrollbar-thin">
               {filteredShortageItems.map(item => {
                 const expireStatus = getExpireStatus(item.expiration_date);
                 return (
                   <div key={item.id} className="bg-red-950/20 border border-red-900/50 p-3 rounded-xl flex flex-col shadow-md">
-                    <span className="font-semibold text-red-200 text-sm mb-1.5">{item.name}</span>
+                    <div className="flex items-center mb-1.5">
+                      <span className="text-[9px] px-1 py-0.5 rounded bg-gray-900 text-gray-400 border border-gray-800 mr-1.5">{item.category || '의약품'}</span>
+                      <span className="font-semibold text-red-200 text-sm truncate">{item.name}</span>
+                    </div>
                     <div className="flex justify-between items-center mb-1">
                        <span className={`text-[10px] px-1.5 py-0.5 rounded border ${expireStatus.classes}`}>기한: {expireStatus.text}</span>
                        <span className="text-xs text-gray-500">#{item.id}</span>
@@ -435,29 +452,37 @@ export default function InventoryDashboard() {
                   </div>
                 );
               })}
+              {filteredShortageItems.length === 0 && <div className="text-center text-gray-500 mt-5 text-xs">보충이 필요한 품목이 없습니다.</div>}
             </div>
           </div>
         )}
 
-        {/* 💡 소모 로그 출력부 고도화 완료 (시효기간 완전 명시) */}
         {rightTab === 'logs' && (
           <div className="flex flex-col flex-1 overflow-hidden">
-            <div className="mb-3"><input type="text" placeholder="품목명 또는 시효기간 날짜 검색..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs focus:outline-none focus:border-blue-500" value={logSearch} onChange={(e) => setLogSearch(e.target.value)} /></div>
+            {/* 💡 신설: 로그 보드 카테고리 서브 필터 버튼 */}
+            <div className="flex space-x-1.5 mb-3 bg-[#0B0F19]/50 p-1 rounded border border-gray-800">
+              <button onClick={() => setLogFilter('전체')} className={`flex-1 py-1 text-[11px] rounded transition-all ${logFilter === '전체' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>전체</button>
+              <button onClick={() => setLogFilter('의약품')} className={`flex-1 py-1 text-[11px] rounded transition-all ${logFilter === '의약품' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>💊 의약품</button>
+              <button onClick={() => setLogFilter('의료기재')} className={`flex-1 py-1 text-[11px] rounded transition-all ${logFilter === '의료기재' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>🩹 의료기재</button>
+            </div>
+            <div className="mb-3"><input type="text" placeholder="로그 검색 (품목명, 날짜)..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs focus:outline-none focus:border-blue-500" value={logSearch} onChange={(e) => setLogSearch(e.target.value)} /></div>
             <div className="flex-1 overflow-y-auto space-y-2 pr-1 scrollbar-thin">
               {filteredLogs.map(log => (
-                <div key={log.id} className="bg-blue-950/10 border border-blue-950/60 p-3 rounded-xl shadow-sm flex flex-col border-l-4 border-l-blue-500">
-                  <span className="text-[11px] text-gray-400 font-medium mb-1">{formatKoreanDate(log.created_at)}</span>
-                  <div className="flex justify-between items-start">
-                    <div className="flex flex-col">
-                      <span className="text-white text-xs font-semibold max-w-[180px] truncate">{log.item_name}</span>
-                      {/* 💡 시효기간 추적 뱃지 출력 라인 추가 */}
-                      <span className="text-[10px] text-yellow-500 font-medium mt-0.5">시효기한: {log.expiration_date || '미기입'}</span>
+                <div key={log.id} className="bg-blue-950/10 border border-blue-950/60 p-3 rounded-xl shadow-sm flex flex-col border-l-4 border-l-blue-500 relative">
+                  <div className="flex justify-between items-center mb-1">
+                    <span className="text-[11px] text-gray-400 font-medium">{formatKoreanDate(log.created_at)}</span>
+                    <span className="text-[9px] px-1 py-0.5 rounded bg-gray-800 text-gray-400 border border-gray-700">{log.category || '의약품'}</span>
+                  </div>
+                  <div className="flex justify-between items-start mt-0.5">
+                    <div className="flex flex-col pr-2">
+                      <span className="text-white text-xs font-semibold max-w-[160px] truncate">{log.item_name}</span>
+                      <span className="text-[10px] text-yellow-500 font-medium mt-0.5">시효: {log.expiration_date || '미기입'}</span>
                     </div>
-                    <span className="text-red-400 font-bold text-xs bg-red-950/30 px-2 py-0.5 rounded border border-red-900/20 shrink-0">-{log.quantity}개 소모</span>
+                    <span className="text-red-400 font-bold text-xs bg-red-950/30 px-2 py-0.5 rounded border border-red-900/20 shrink-0">-{log.quantity}개</span>
                   </div>
                 </div>
               ))}
-              {filteredLogs.length === 0 && <div className="text-center text-gray-500 mt-10 text-xs">소모 처리 이력이 존재하지 않습니다.</div>}
+              {filteredLogs.length === 0 && <div className="text-center text-gray-500 mt-10 text-xs">해당 분류의 소모 이력이 없습니다.</div>}
             </div>
           </div>
         )}
