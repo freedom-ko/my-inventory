@@ -14,11 +14,27 @@ const FALLBACK_CACHE: { [key: string]: { name: string; category: string } } = {
   '8806415000014': { name: '타이레놀정 500mg', category: '의약품' }
 };
 
-export default function InventoryDashboard() {
+interface RequisitionNote {
+  id: number;
+  item_name: string;
+  amount: number;
+  memo: string;
+  is_claimed: boolean;
+  created_at: string;
+}
+
+export default function Home() {
   const [items, setItems] = useState<any[]>([]);
   const [shortageItems, setShortageItems] = useState<any[]>([]);
   const [logs, setLogs] = useState<any[]>([]);
   
+  // 💡 신설: 상단 네비게이션 메뉴 탭 상태 및 청구 메모장 데이터/입력값 상태 (사용자 스키마 동기화)
+  const [menuTab, setMenuTab] = useState<'dashboard' | 'requisition'>('requisition');
+  const [notes, setNotes] = useState<RequisitionNote[]>([]);
+  const [itemName, setItemName] = useState('');
+  const [amount, setAmount] = useState<number>(1);
+  const [memo, setMemo] = useState('');
+
   const [rightTab, setRightTab] = useState<'shortage' | 'logs'>('shortage');
   const [leftSearch, setLeftSearch] = useState('');
   const [rightSearch, setRightSearch] = useState('');
@@ -79,10 +95,20 @@ export default function InventoryDashboard() {
     if (data) setLogs(data);
   };
 
+  // 💡 신설: 청구 메모 데이터 조회
+  const fetchNotes = async () => {
+    const { data, error } = await supabase
+      .from('requisition_notes')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (!error && data) setNotes(data);
+  };
+
   useEffect(() => {
     fetchMainItems(leftSearch, viewMode);
     fetchShortageItems();
     fetchLogs();
+    fetchNotes();
 
     const channel = supabase.channel('realtime inventory master')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'items' }, () => {
@@ -91,6 +117,9 @@ export default function InventoryDashboard() {
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'inventory_logs' }, () => {
         fetchLogs();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'requisition_notes' }, () => {
+        fetchNotes();
       })
       .subscribe();
     return () => { supabase.removeChannel(channel); };
@@ -298,6 +327,36 @@ export default function InventoryDashboard() {
     await supabase.from('items').delete().eq('id', item.id);
   };
 
+  // 💡 신설: 청구 메모 CRUD 핸들러
+  const handleAddRequisition = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!itemName) return;
+
+    const { error } = await supabase
+      .from('requisition_notes')
+      .insert([{ item_name: itemName, amount, memo, is_claimed: false }]);
+
+    if (!error) {
+      setItemName('');
+      setAmount(1);
+      setMemo('');
+    }
+  };
+
+  const handleToggleClaimed = async (id: number, currentStatus: boolean) => {
+    setNotes(prev => prev.map(n => n.id === id ? { ...n, is_claimed: !currentStatus } : n));
+    await supabase
+      .from('requisition_notes')
+      .update({ is_claimed: !currentStatus })
+      .eq('id', id);
+  };
+
+  const handleDeleteRequisition = async (id: number) => {
+    if (!confirm("이 청구 메모를 삭제하시겠습니까?")) return;
+    setNotes(prev => prev.filter(n => n.id !== id));
+    await supabase.from('requisition_notes').delete().eq('id', id);
+  };
+
   // 💡 개선: 이름 검색과 더불어 '의약품 / 의료기재' 탭 상태에 따른 이중 필터링 적용
   const filteredShortageItems = shortageItems.filter(item => {
     const matchSearch = item.name.toLowerCase().includes(rightSearch.toLowerCase());
@@ -310,7 +369,6 @@ export default function InventoryDashboard() {
     const matchCategory = logFilter === '전체' ? true : (log.category || '의약품') === logFilter;
     return matchSearch && matchCategory;
   });
-
   const getExpireStatus = (dateStr: string) => {
     if (!dateStr || dateStr.trim() === '') return { text: '미기입', classes: 'text-gray-400 bg-gray-900/60 border-gray-800' };
     const expDate = new Date(dateStr);
@@ -330,164 +388,293 @@ export default function InventoryDashboard() {
   };
 
   return (
-    <div className="flex flex-col lg:flex-row h-screen bg-[#0B0F19] text-gray-200 font-sans overflow-hidden">
+    <div className="min-h-screen bg-gray-950 text-gray-100 font-sans">
       
-      {/* 🟢 좌측 메인 영역 */}
-      <div className="flex-1 p-4 lg:p-8 overflow-y-auto">
-        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-4 gap-3">
-          <h1 className="text-xl lg:text-2xl font-bold text-white tracking-tight">전체 재고 관리 대시보드</h1>
-          <div className="flex space-x-2 w-full sm:w-auto">
-            <button onClick={startScanner} className="flex-1 sm:flex-none px-3.5 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 font-black rounded-lg text-white shadow-lg text-xs lg:text-sm flex items-center justify-center border border-emerald-500/30">
-              <span className="mr-1.5">📷</span> 바코드 스캔
-            </button>
-            <button onClick={() => setIsAddModalOpen(true)} className="flex-1 sm:flex-none px-3 py-2 bg-blue-600 hover:bg-blue-500 font-bold rounded-lg text-white text-xs lg:text-sm">+ 새 품목 등록</button>
-            <button onClick={() => setIsDeleteMode(!isDeleteMode)} className={`px-3 py-2 font-bold rounded-lg text-white text-xs lg:text-sm transition-colors ${isDeleteMode ? 'bg-red-600 ring-2 ring-red-400' : 'bg-gray-800'}`}>{isDeleteMode ? '🚫 종료' : '🗑️ 삭제'}</button>
-          </div>
+      {/* 🔮 프리미엄 상단 네비게이션 바 (사용자 제안 스펙 반영) */}
+      <nav className="bg-gray-900 border-b border-gray-800 px-6 py-4 flex items-center justify-between sticky top-0 z-50">
+        <div className="flex items-center space-x-2">
+          <span className="text-xl font-bold tracking-wider text-blue-400">MY INVENTORY</span>
         </div>
+        <div className="flex space-x-1 bg-gray-950 p-1 rounded-lg border border-gray-800">
+          <button
+            onClick={() => setMenuTab('dashboard')}
+            className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+              menuTab === 'dashboard' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'
+            }`}
+          >
+            📦 재고 대시보드
+          </button>
+          <button
+            onClick={() => setMenuTab('requisition')}
+            className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+              menuTab === 'requisition' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'
+            }`}
+          >
+            📝 물품 청구 메모장
+          </button>
+        </div>
+      </nav>
 
-        <div className="flex space-x-2 mb-4 lg:mb-6 bg-[#111827] p-1 rounded-lg w-fit border border-gray-800">
-          <button onClick={() => setViewMode('active')} className={`px-3 py-1.5 lg:px-4 lg:py-2 rounded-md text-xs font-bold transition-all ${viewMode === 'active' ? 'bg-blue-600 text-white shadow' : 'text-gray-400 hover:text-white'}`}>📋 취급 품목만 보기</button>
-          <button onClick={() => setViewMode('all')} className={`px-3 py-1.5 lg:px-4 lg:py-2 rounded-md text-xs font-bold transition-all ${viewMode === 'all' ? 'bg-gray-800 text-white shadow border border-gray-700' : 'text-gray-400 hover:text-white'}`}>🌐 전체 창고 보기</button>
-        </div>
-        
-        <div className="mb-4 lg:mb-6 flex items-center space-x-2">
-          <input type="text" placeholder="검색 또는 바코드 스캔 번호 자동 주입..." className="w-full max-w-md p-2.5 lg:p-3 rounded-lg bg-[#111827] border border-gray-700 text-white text-sm focus:outline-none focus:border-blue-500" value={leftSearch} onChange={(e) => setLeftSearch(e.target.value)} />
-          {leftSearch && <button onClick={() => setLeftSearch('')} className="px-2.5 py-1.5 bg-gray-800 rounded text-xs text-gray-400">초기화</button>}
-        </div>
+      {/* 메인 컨텐츠 영역 */}
+      {menuTab === 'dashboard' ? (
+        <div className="flex flex-col lg:flex-row h-[calc(100vh-73px)] bg-[#0B0F19] text-gray-200 overflow-hidden">
+          
+          {/* 🟢 좌측 메인 영역 */}
+          <div className="flex-1 p-4 lg:p-8 overflow-y-auto">
+            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-4 gap-3">
+              <h1 className="text-xl lg:text-2xl font-bold text-white tracking-tight">전체 재고 관리 대시보드</h1>
+              <div className="flex space-x-2 w-full sm:w-auto">
+                <button onClick={startScanner} className="flex-1 sm:flex-none px-3.5 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 font-black rounded-lg text-white shadow-lg text-xs lg:text-sm flex items-center justify-center border border-emerald-500/30">
+                  <span className="mr-1.5">📷</span> 바코드 스캔
+                </button>
+                <button onClick={() => setIsAddModalOpen(true)} className="flex-1 sm:flex-none px-3 py-2 bg-blue-600 hover:bg-blue-500 font-bold rounded-lg text-white text-xs lg:text-sm">+ 새 품목 등록</button>
+                <button onClick={() => setIsDeleteMode(!isDeleteMode)} className={`px-3 py-2 font-bold rounded-lg text-white text-xs lg:text-sm transition-colors ${isDeleteMode ? 'bg-red-600 ring-2 ring-red-400' : 'bg-gray-800'}`}>{isDeleteMode ? '🚫 종료' : '🗑️ 삭제'}</button>
+              </div>
+            </div>
 
-        <div className="bg-[#111827] rounded-xl shadow-2xl border border-gray-800/80 p-3 lg:p-5 overflow-x-auto">
-          <table className="w-full text-left border-collapse min-w-[1000px]">
-            <thead>
-              <tr className="border-b border-gray-700 text-gray-400 text-sm">
-                {isDeleteMode && <th className="pb-3 font-semibold text-center w-12 text-red-400">삭제</th>}
-                <th className="pb-3 font-semibold w-20">고유 번호</th>
-                <th className="pb-3 font-semibold w-1/3">품목명</th>
-                <th className="pb-3 font-semibold w-32 text-center text-yellow-400">시효기간</th>
-                <th className="pb-3 font-semibold text-center w-24">취급 상태</th>
-                <th className="pb-3 font-semibold text-center w-80">재고 제어</th>
-                <th className="pb-3 font-semibold text-right pr-6 w-24">현재고</th>
-              </tr>
-            </thead>
-            <tbody>
-              {items.map(item => {
-                const expireStatus = getExpireStatus(item.expiration_date);
-                return (
-                  <tr key={item.id} className={`border-b border-gray-800/60 hover:bg-gray-800/30 transition-all duration-150 group ${!item.is_active && 'opacity-50'}`}>
-                    {isDeleteMode && (
-                      <td className="py-4 text-center">
-                        <button onClick={() => handleDeleteItem(item)} className="p-1.5 rounded bg-red-950/40 hover:bg-red-600 text-red-400 hover:text-white"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4"><path strokeLinecap="round" strokeLinejoin="round" d="m14.74 9-.34 12m-4.72 0L9 9m11.42 3.31a48.667 48.667 0 0 0-7.36-1.91M3.14 12.29a48.008 48.008 0 0 1 7.36-1.91M19.485 12c.262 2.384.444 4.8.54 7.232M4.515 12c-.263 2.384-.444 4.8-.54 7.232M8.25h7.5M4.56 8.25h14.88" /></svg></button>
-                      </td>
-                    )}
-                    <td className="py-4 text-gray-500 text-sm">#{item.id}</td>
-                    <td className="py-4 font-medium text-white">
-                      <div className="flex items-center">
-                        {/* 💡 테이블의 품목명 옆에도 작게 카테고리 뱃지를 표시하면 직관적입니다. */}
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 border border-gray-700 mr-2 shrink-0">{item.category || '의약품'}</span>
-                        <span className="truncate max-w-xs">{item.name}</span>
-                        <button onClick={() => { setSelectedItem(item); setEditName(item.name); setIsEditModalOpen(true); }} className="ml-2 opacity-100 lg:opacity-0 lg:group-hover:opacity-100 text-gray-400 hover:text-blue-400 p-1 rounded hover:bg-gray-800 bg-gray-800/50 lg:bg-transparent"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.8} stroke="currentColor" className="w-3.5 h-3.5"><path strokeLinecap="round" strokeLinejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L6.832 19.82a4.5 4.5 0 0 1-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 0 1 1.13-1.897L16.863 4.487Zm0 0L19.5 7.125" /></svg></button>
-                      </div>
-                    </td>
-                    <td className="py-4 text-center">
-                      <div className="flex flex-col items-center justify-center gap-1">
-                        <span className={`text-[11px] px-2 py-0.5 rounded border transition-colors ${expireStatus.classes}`}>{expireStatus.text}</span>
-                        {item.is_active && <button onClick={() => { setSelectedItem(item); setIsExpireModalOpen(true); }} className="text-[10px] bg-gray-800 hover:bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded border border-gray-700 transition-all font-medium mt-0.5">+ 기한 추가</button>}
-                      </div>
-                    </td>
-                    <td className="py-4 text-center">
-                      <button onClick={() => toggleActiveStatus(item)} className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${item.is_active ? 'bg-blue-600' : 'bg-gray-700'}`}><span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${item.is_active ? 'translate-x-6' : 'translate-x-1'}`} /></button>
-                    </td>
-                    <td className="py-4 text-center">
-                      <div className="inline-flex items-center space-x-3 bg-[#0B0F19]/40 px-3 py-1.5 rounded-lg border border-gray-800">
-                        <div className="inline-flex rounded-md shadow-sm bg-[#0B0F19] p-0.5 border border-gray-700">
-                          <button onClick={() => handleRelativeClick(item, -1)} disabled={!item.is_active} className="px-3 py-1 text-sm font-bold text-red-400 hover:bg-gray-800 rounded disabled:opacity-30">-</button>
-                          <span className="px-1 text-gray-700">|</span>
-                          <button onClick={() => handleRelativeClick(item, 1)} disabled={!item.is_active} className="px-3 py-1 text-sm font-bold text-green-400 hover:bg-gray-800 rounded disabled:opacity-30">+</button>
-                        </div>
-                        <span className="text-gray-700 font-light">/</span>
-                        <div className="flex items-center space-x-1.5">
-                          <input type="text" placeholder="+/-수량" disabled={!item.is_active} className="w-16 p-1.5 text-center rounded bg-[#0B0F19] border border-gray-700 text-white text-xs focus:outline-none focus:border-blue-500" value={inputValues[item.id] || ''} onChange={(e) => handleInputChange(item.id, e.target.value)} />
-                          <button onClick={() => handleAbsoluteClick(item)} disabled={!item.is_active} className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 text-xs font-bold rounded text-white transition-colors disabled:opacity-30">적용</button>
-                        </div>
-                      </div>
-                    </td>
-                    <td className={`py-4 font-bold text-right pr-6 text-lg transition-all ${item.current_stock < 50 ? 'text-red-400' : 'text-emerald-400'}`}>{item.current_stock}</td>
+            <div className="flex space-x-2 mb-4 lg:mb-6 bg-[#111827] p-1 rounded-lg w-fit border border-gray-800">
+              <button onClick={() => setViewMode('active')} className={`px-3 py-1.5 lg:px-4 lg:py-2 rounded-md text-xs font-bold transition-all ${viewMode === 'active' ? 'bg-blue-600 text-white shadow' : 'text-gray-400 hover:text-white'}`}>📋 취급 품목만 보기</button>
+              <button onClick={() => setViewMode('all')} className={`px-3 py-1.5 lg:px-4 lg:py-2 rounded-md text-xs font-bold transition-all ${viewMode === 'all' ? 'bg-gray-800 text-white shadow border border-gray-700' : 'text-gray-400 hover:text-white'}`}>🌐 전체 창고 보기</button>
+            </div>
+            
+            <div className="mb-4 lg:mb-6 flex items-center space-x-2">
+              <input type="text" placeholder="검색 또는 바코드 스캔 번호 자동 주입..." className="w-full max-w-md p-2.5 lg:p-3 rounded-lg bg-[#111827] border border-gray-700 text-white text-sm focus:outline-none focus:border-blue-500" value={leftSearch} onChange={(e) => setLeftSearch(e.target.value)} />
+              {leftSearch && <button onClick={() => setLeftSearch('')} className="px-2.5 py-1.5 bg-gray-800 rounded text-xs text-gray-400">초기화</button>}
+            </div>
+
+            <div className="bg-[#111827] rounded-xl shadow-2xl border border-gray-800/80 p-3 lg:p-5 overflow-x-auto">
+              <table className="w-full text-left border-collapse min-w-[1000px]">
+                <thead>
+                  <tr className="border-b border-gray-700 text-gray-400 text-sm">
+                    {isDeleteMode && <th className="pb-3 font-semibold text-center w-12 text-red-400">삭제</th>}
+                    <th className="pb-3 font-semibold w-20">고유 번호</th>
+                    <th className="pb-3 font-semibold w-1/3">품목명</th>
+                    <th className="pb-3 font-semibold w-32 text-center text-yellow-400">시효기간</th>
+                    <th className="pb-3 font-semibold text-center w-24">취급 상태</th>
+                    <th className="pb-3 font-semibold text-center w-80">재고 제어</th>
+                    <th className="pb-3 font-semibold text-right pr-6 w-24">현재고</th>
                   </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* 🔴 우측 탭 제어 피드 */}
-      <div className="w-full lg:w-96 h-[45vh] lg:h-auto bg-[#111827] border-t lg:border-t-0 lg:border-l border-gray-800/80 p-4 lg:p-6 flex flex-col shadow-2xl shrink-0 z-10">
-        <div className="flex space-x-1 bg-[#0B0F19] p-1 rounded-lg border border-gray-800 mb-3">
-          <button onClick={() => setRightTab('shortage')} className={`flex-1 py-2 text-center rounded-md text-xs font-black transition-all ${rightTab === 'shortage' ? 'bg-red-950/60 text-red-400 shadow' : 'text-gray-500'}`}>🚨 긴급 보충</button>
-          <button onClick={() => setRightTab('logs')} className={`flex-1 py-2 text-center rounded-md text-xs font-black transition-all ${rightTab === 'logs' ? 'bg-blue-950/60 text-blue-400 shadow' : 'text-gray-500'}`}>📋 소모 로그</button>
-        </div>
-
-        {rightTab === 'shortage' && (
-          <div className="flex flex-col flex-1 overflow-hidden">
-            {/* 💡 신설: 긴급 보충 카테고리 서브 필터 버튼 */}
-            <div className="flex space-x-1.5 mb-3 bg-[#0B0F19]/50 p-1 rounded border border-gray-800">
-              <button onClick={() => setShortageFilter('전체')} className={`flex-1 py-1 text-[11px] rounded transition-all ${shortageFilter === '전체' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>전체</button>
-              <button onClick={() => setShortageFilter('의약품')} className={`flex-1 py-1 text-[11px] rounded transition-all ${shortageFilter === '의약품' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>💊 의약품</button>
-              <button onClick={() => setShortageFilter('의료기재')} className={`flex-1 py-1 text-[11px] rounded transition-all ${shortageFilter === '의료기재' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>🩹 의료기재</button>
-            </div>
-            <div className="mb-3"><input type="text" placeholder="부족 품목 검색..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs" value={rightSearch} onChange={(e) => setRightSearch(e.target.value)} /></div>
-            <div className="flex-1 overflow-y-auto space-y-2.5 pr-1 scrollbar-thin">
-              {filteredShortageItems.map(item => {
-                const expireStatus = getExpireStatus(item.expiration_date);
-                return (
-                  <div key={item.id} className="bg-red-950/20 border border-red-900/50 p-3 rounded-xl flex flex-col shadow-md">
-                    <div className="flex items-center mb-1.5">
-                      <span className="text-[9px] px-1 py-0.5 rounded bg-gray-900 text-gray-400 border border-gray-800 mr-1.5">{item.category || '의약품'}</span>
-                      <span className="font-semibold text-red-200 text-sm truncate">{item.name}</span>
-                    </div>
-                    <div className="flex justify-between items-center mb-1">
-                       <span className={`text-[10px] px-1.5 py-0.5 rounded border ${expireStatus.classes}`}>기한: {expireStatus.text}</span>
-                       <span className="text-xs text-gray-500">#{item.id}</span>
-                    </div>
-                    <div className="flex justify-end items-center"><span className="text-xs text-gray-400">재고: <span className="text-red-400 font-black">{item.current_stock}개</span></span></div>
-                  </div>
-                );
-              })}
-              {filteredShortageItems.length === 0 && <div className="text-center text-gray-500 mt-5 text-xs">보충이 필요한 품목이 없습니다.</div>}
+                </thead>
+                <tbody>
+                  {items.map(item => {
+                    const expireStatus = getExpireStatus(item.expiration_date);
+                    return (
+                      <tr key={item.id} className={`border-b border-gray-800/60 hover:bg-gray-800/30 transition-all duration-150 group ${!item.is_active && 'opacity-50'}`}>
+                        {isDeleteMode && (
+                          <td className="py-4 text-center">
+                            <button onClick={() => handleDeleteItem(item)} className="p-1.5 rounded bg-red-950/40 hover:bg-red-600 text-red-400 hover:text-white"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4"><path strokeLinecap="round" strokeLinejoin="round" d="m14.74 9-.34 12m-4.72 0L9 9m11.42 3.31a48.667 48.667 0 0 0-7.36-1.91M3.14 12.29a48.008 48.008 0 0 1 7.36-1.91M19.485 12c.262 2.384.444 4.8.54 7.232M4.515 12c-.263 2.384-.444 4.8-.54 7.232M8.25h7.5M4.56 8.25h14.88" /></svg></button>
+                          </td>
+                        )}
+                        <td className="py-4 text-gray-500 text-sm">#{item.id}</td>
+                        <td className="py-4 font-medium text-white">
+                          <div className="flex items-center">
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 border border-gray-700 mr-2 shrink-0">{item.category || '의약품'}</span>
+                            <span className="truncate max-w-xs">{item.name}</span>
+                            <button onClick={() => { setSelectedItem(item); setEditName(item.name); setIsEditModalOpen(true); }} className="ml-2 opacity-100 lg:opacity-0 lg:group-hover:opacity-100 text-gray-400 hover:text-blue-400 p-1 rounded hover:bg-gray-800 bg-gray-800/50 lg:bg-transparent"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.8} stroke="currentColor" className="w-3.5 h-3.5"><path strokeLinecap="round" strokeLinejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L6.832 19.82a4.5 4.5 0 0 1-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 0 1 1.13-1.897L16.863 4.487Zm0 0L19.5 7.125" /></svg></button>
+                          </div>
+                        </td>
+                        <td className="py-4 text-center">
+                          <div className="flex flex-col items-center justify-center gap-1">
+                            <span className={`text-[11px] px-2 py-0.5 rounded border transition-colors ${expireStatus.classes}`}>{expireStatus.text}</span>
+                            {item.is_active && <button onClick={() => { setSelectedItem(item); setIsExpireModalOpen(true); }} className="text-[10px] bg-gray-800 hover:bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded border border-gray-700 transition-all font-medium mt-0.5">+ 기한 추가</button>}
+                          </div>
+                        </td>
+                        <td className="py-4 text-center">
+                          <button onClick={() => toggleActiveStatus(item)} className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${item.is_active ? 'bg-blue-600' : 'bg-gray-700'}`}><span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${item.is_active ? 'translate-x-6' : 'translate-x-1'}`} /></button>
+                        </td>
+                        <td className="py-4 text-center">
+                          <div className="inline-flex items-center space-x-3 bg-[#0B0F19]/40 px-3 py-1.5 rounded-lg border border-gray-800">
+                            <div className="inline-flex rounded-md shadow-sm bg-[#0B0F19] p-0.5 border border-gray-700">
+                              <button onClick={() => handleRelativeClick(item, -1)} disabled={!item.is_active} className="px-3 py-1 text-sm font-bold text-red-400 hover:bg-gray-800 rounded disabled:opacity-30">-</button>
+                              <span className="px-1 text-gray-700">|</span>
+                              <button onClick={() => handleRelativeClick(item, 1)} disabled={!item.is_active} className="px-3 py-1 text-sm font-bold text-green-400 hover:bg-gray-800 rounded disabled:opacity-30">+</button>
+                            </div>
+                            <span className="text-gray-700 font-light">/</span>
+                            <div className="flex items-center space-x-1.5">
+                              <input type="text" placeholder="+/-수량" disabled={!item.is_active} className="w-16 p-1.5 text-center rounded bg-[#0B0F19] border border-gray-700 text-white text-xs focus:outline-none focus:border-blue-500" value={inputValues[item.id] || ''} onChange={(e) => handleInputChange(item.id, e.target.value)} />
+                              <button onClick={() => handleAbsoluteClick(item)} disabled={!item.is_active} className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 text-xs font-bold rounded text-white transition-colors disabled:opacity-30">적용</button>
+                            </div>
+                          </div>
+                        </td>
+                        <td className={`py-4 font-bold text-right pr-6 text-lg transition-all ${item.current_stock < 50 ? 'text-red-400' : 'text-emerald-400'}`}>{item.current_stock}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
           </div>
-        )}
 
-        {rightTab === 'logs' && (
-          <div className="flex flex-col flex-1 overflow-hidden">
-            {/* 💡 신설: 로그 보드 카테고리 서브 필터 버튼 */}
-            <div className="flex space-x-1.5 mb-3 bg-[#0B0F19]/50 p-1 rounded border border-gray-800">
-              <button onClick={() => setLogFilter('전체')} className={`flex-1 py-1 text-[11px] rounded transition-all ${logFilter === '전체' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>전체</button>
-              <button onClick={() => setLogFilter('의약품')} className={`flex-1 py-1 text-[11px] rounded transition-all ${logFilter === '의약품' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>💊 의약품</button>
-              <button onClick={() => setLogFilter('의료기재')} className={`flex-1 py-1 text-[11px] rounded transition-all ${logFilter === '의료기재' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>🩹 의료기재</button>
+          {/* 🔴 우측 탭 제어 피드 */}
+          <div className="w-full lg:w-96 h-[45vh] lg:h-auto bg-[#111827] border-t lg:border-t-0 lg:border-l border-gray-800/80 p-4 lg:p-6 flex flex-col shadow-2xl shrink-0 z-10">
+            <div className="flex space-x-1 bg-[#0B0F19] p-1 rounded-lg border border-gray-800 mb-3">
+              <button onClick={() => setRightTab('shortage')} className={`flex-1 py-2 text-center rounded-md text-xs font-black transition-all ${rightTab === 'shortage' ? 'bg-red-950/60 text-red-400 shadow' : 'text-gray-500'}`}>🚨 긴급 보충</button>
+              <button onClick={() => setRightTab('logs')} className={`flex-1 py-2 text-center rounded-md text-xs font-black transition-all ${rightTab === 'logs' ? 'bg-blue-950/60 text-blue-400 shadow' : 'text-gray-500'}`}>📋 소모 로그</button>
             </div>
-            <div className="mb-3"><input type="text" placeholder="로그 검색 (품목명, 날짜)..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs focus:outline-none focus:border-blue-500" value={logSearch} onChange={(e) => setLogSearch(e.target.value)} /></div>
-            <div className="flex-1 overflow-y-auto space-y-2 pr-1 scrollbar-thin">
-              {filteredLogs.map(log => (
-                <div key={log.id} className="bg-blue-950/10 border border-blue-950/60 p-3 rounded-xl shadow-sm flex flex-col border-l-4 border-l-blue-500 relative">
-                  <div className="flex justify-between items-center mb-1">
-                    <span className="text-[11px] text-gray-400 font-medium">{formatKoreanDate(log.created_at)}</span>
-                    <span className="text-[9px] px-1 py-0.5 rounded bg-gray-800 text-gray-400 border border-gray-700">{log.category || '의약품'}</span>
-                  </div>
-                  <div className="flex justify-between items-start mt-0.5">
-                    <div className="flex flex-col pr-2">
-                      <span className="text-white text-xs font-semibold max-w-[160px] truncate">{log.item_name}</span>
-                      <span className="text-[10px] text-yellow-500 font-medium mt-0.5">시효: {log.expiration_date || '미기입'}</span>
+
+            {rightTab === 'shortage' && (
+              <div className="flex flex-col flex-1 overflow-hidden">
+                <div className="flex space-x-1.5 mb-3 bg-[#0B0F19]/50 p-1 rounded border border-gray-800">
+                  <button onClick={() => setShortageFilter('전체')} className={`flex-1 py-1 text-[11px] rounded transition-all ${shortageFilter === '전체' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>전체</button>
+                  <button onClick={() => setShortageFilter('의약품')} className={`flex-1 py-1 text-[11px] rounded transition-all ${shortageFilter === '의약품' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>💊 의약품</button>
+                  <button onClick={() => setShortageFilter('의료기재')} className={`flex-1 py-1 text-[11px] rounded transition-all ${shortageFilter === '의료기재' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>🩹 의료기재</button>
+                </div>
+                <div className="mb-3"><input type="text" placeholder="부족 품목 검색..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs" value={rightSearch} onChange={(e) => setRightSearch(e.target.value)} /></div>
+                <div className="flex-1 overflow-y-auto space-y-2.5 pr-1 scrollbar-thin">
+                  {filteredShortageItems.map(item => {
+                    const expireStatus = getExpireStatus(item.expiration_date);
+                    return (
+                      <div key={item.id} className="bg-red-950/20 border border-red-900/50 p-3 rounded-xl flex flex-col shadow-md">
+                        <div className="flex items-center mb-1.5">
+                          <span className="text-[9px] px-1 py-0.5 rounded bg-gray-900 text-gray-400 border border-gray-800 mr-1.5">{item.category || '의약품'}</span>
+                          <span className="font-semibold text-red-200 text-sm truncate">{item.name}</span>
+                        </div>
+                        <div className="flex justify-between items-center mb-1">
+                           <span className={`text-[10px] px-1.5 py-0.5 rounded border ${expireStatus.classes}`}>기한: {expireStatus.text}</span>
+                           <span className="text-xs text-gray-500">#{item.id}</span>
+                        </div>
+                        <div className="flex justify-end items-center"><span className="text-xs text-gray-400">재고: <span className="text-red-400 font-black">{item.current_stock}개</span></span></div>
+                      </div>
+                    );
+                  })}
+                  {filteredShortageItems.length === 0 && <div className="text-center text-gray-500 mt-5 text-xs">보충이 필요한 품목이 없습니다.</div>}
+                </div>
+              </div>
+            )}
+
+            {rightTab === 'logs' && (
+              <div className="flex flex-col flex-1 overflow-hidden">
+                <div className="flex space-x-1.5 mb-3 bg-[#0B0F19]/50 p-1 rounded border border-gray-800">
+                  <button onClick={() => setLogFilter('전체')} className={`flex-1 py-1 text-[11px] rounded transition-all ${logFilter === '전체' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>전체</button>
+                  <button onClick={() => setLogFilter('의약품')} className={`flex-1 py-1 text-[11px] rounded transition-all ${logFilter === '의약품' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>💊 의약품</button>
+                  <button onClick={() => setLogFilter('의료기재')} className={`flex-1 py-1 text-[11px] rounded transition-all ${logFilter === '의료기재' ? 'bg-gray-700 text-white font-bold' : 'text-gray-400'}`}>🩹 의료기재</button>
+                </div>
+                <div className="mb-3"><input type="text" placeholder="로그 검색 (품목명, 날짜)..." className="w-full p-2.5 rounded-lg bg-[#0B0F19] border border-gray-700 text-white text-xs focus:outline-none focus:border-blue-500" value={logSearch} onChange={(e) => setLogSearch(e.target.value)} /></div>
+                <div className="flex-1 overflow-y-auto space-y-2 pr-1 scrollbar-thin">
+                  {filteredLogs.map(log => (
+                    <div key={log.id} className="bg-blue-950/10 border border-blue-950/60 p-3 rounded-xl shadow-sm flex flex-col border-l-4 border-l-blue-500 relative">
+                      <div className="flex justify-between items-center mb-1">
+                        <span className="text-[11px] text-gray-400 font-medium">{formatKoreanDate(log.created_at)}</span>
+                        <span className="text-[9px] px-1 py-0.5 rounded bg-gray-800 text-gray-400 border border-gray-700">{log.category || '의약품'}</span>
+                      </div>
+                      <div className="flex justify-between items-start mt-0.5">
+                        <div className="flex flex-col pr-2">
+                          <span className="text-white text-xs font-semibold max-w-[160px] truncate">{log.item_name}</span>
+                          <span className="text-[10px] text-yellow-500 font-medium mt-0.5">시효: {log.expiration_date || '미기입'}</span>
+                        </div>
+                        <span className="text-red-400 font-bold text-xs bg-red-950/30 px-2 py-0.5 rounded border border-red-900/20 shrink-0">-{log.quantity}개</span>
+                      </div>
                     </div>
-                    <span className="text-red-400 font-bold text-xs bg-red-950/30 px-2 py-0.5 rounded border border-red-900/20 shrink-0">-{log.quantity}개</span>
+                  ))}
+                  {filteredLogs.length === 0 && <div className="text-center text-gray-500 mt-10 text-xs">해당 분류의 소모 이력이 없습니다.</div>}
+                </div>
+              </div>
+            )}
+          </div>
+
+        </div>
+      ) : (
+        /* 📝 물품 청구 메모장 페이지 (사용자 제안 스타일 1:1 완벽 임베딩) */
+        <main className="max-w-7xl mx-auto p-6">
+          <div>
+            {/* 상단 메모 등록 폼 */}
+            <div className="bg-gray-900 p-6 rounded-xl border border-gray-800 mb-8">
+              <h2 className="text-lg font-bold mb-4 text-blue-400">📝 새 청구 물품 등록</h2>
+              <form onSubmit={handleAddRequisition} className="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">물품명</label>
+                  <input
+                    type="text"
+                    value={itemName}
+                    onChange={(e) => setItemName(e.target.value)}
+                    placeholder="필요한 물품 입력"
+                    className="w-full bg-gray-950 border border-gray-800 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">수량</label>
+                  <input
+                    type="number"
+                    value={amount}
+                    onChange={(e) => setAmount(Number(e.target.value))}
+                    min="1"
+                    className="w-full bg-gray-950 border border-gray-800 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">요청 메모 (선택)</label>
+                  <input
+                    type="text"
+                    value={memo}
+                    onChange={(e) => setMemo(e.target.value)}
+                    placeholder="담당자 참고사항"
+                    className="w-full bg-gray-950 border border-gray-800 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+                <div className="md:col-span-3 flex justify-end mt-2">
+                  <button type="submit" className="bg-blue-600 hover:bg-blue-500 px-6 py-2 rounded-lg text-sm font-medium transition-colors">
+                    메모 추가하기
+                  </button>
+                </div>
+              </form>
+            </div>
+
+            {/* 바둑판식 청구 메모 목록 */}
+            <h2 className="text-xl font-bold mb-4 flex items-center space-x-2">
+              <span>청구 대기 목록</span>
+              <span className="text-sm bg-blue-900/40 text-blue-400 px-2 py-0.5 rounded-full border border-blue-800/60">{notes.length}</span>
+            </h2>
+            
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+              {notes.map((note) => (
+                <div
+                  key={note.id}
+                  className={`relative p-5 rounded-xl border transition-all ${
+                    note.is_claimed
+                      ? 'bg-gray-900/40 border-gray-900 text-gray-500 opacity-60 line-through'
+                      : 'bg-gray-900 border-gray-800 hover:border-gray-700 text-gray-100'
+                  }`}
+                >
+                  {/* 우측 상단 삭제 버튼 */}
+                  <button
+                    onClick={() => handleDeleteRequisition(note.id)}
+                    className="absolute top-3 right-3 text-gray-500 hover:text-red-400 transition-colors"
+                  >
+                    ✕
+                  </button>
+
+                  <div className="font-bold text-lg mb-1 truncate pr-6">{note.item_name}</div>
+                  <div className="text-sm text-blue-400 font-medium mb-3">수량: {note.amount}개</div>
+                  <p className="text-xs text-gray-400 min-h-[40px] mb-4 break-all">{note.memo || '추가 요청사항 없음'}</p>
+                  
+                  {/* 하단 청구 토글 체크박스 */}
+                  <div className="flex items-center space-x-2 border-t border-gray-800/60 pt-3 mt-2">
+                    <input
+                      type="checkbox"
+                      id={`check-${note.id}`}
+                      checked={note.is_claimed}
+                      onChange={() => handleToggleClaimed(note.id, note.is_claimed)}
+                      className="w-4 h-4 rounded border-gray-700 bg-gray-950 text-blue-600 focus:ring-0"
+                    />
+                    <label htmlFor={`check-${note.id}`} className="text-xs cursor-pointer select-none text-gray-400">
+                      {note.is_claimed ? '청구 완료됨' : '청구 완료 처리하기'}
+                    </label>
                   </div>
                 </div>
               ))}
-              {filteredLogs.length === 0 && <div className="text-center text-gray-500 mt-10 text-xs">해당 분류의 소모 이력이 없습니다.</div>}
+              {notes.length === 0 && (
+                <div className="col-span-full py-12 text-center text-gray-500 bg-gray-900/20 border border-dashed border-gray-800 rounded-xl">
+                  등록된 청구 메모가 없습니다. 필요한 물품을 위에 적어보세요!
+                </div>
+              )}
             </div>
           </div>
-        )}
-      </div>
+        </main>
+      )}
 
+      {/* 🔴 전역 모달 레이어 */}
       {isScannerOpen && (
         <div className="fixed inset-0 bg-black/95 flex flex-col items-center justify-center z-50 p-4 backdrop-blur-md animate-fade-in">
           <div className="bg-[#111827] border border-gray-800 rounded-3xl p-4 max-w-md w-full flex flex-col shadow-2xl">
